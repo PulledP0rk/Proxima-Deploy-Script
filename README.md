@@ -12,30 +12,16 @@ On a clean container or VM the only thing you need is this script.
 
 ## Quick start
 
-Run as **root** on a fresh Debian/Ubuntu container or VM:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/PulledP0rk/Proxima-Deploy-Script/main/proxima.sh | bash
-```
-
-Not running as root? Use `sudo bash`:
+Run on a fresh Debian/Ubuntu container or VM:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PulledP0rk/Proxima-Deploy-Script/main/proxima.sh | sudo bash
 ```
 
-Prefer to read it before running it (recommended for any `curl | bash`):
-
-```bash
-curl -fsSL -o proxima.sh https://raw.githubusercontent.com/PulledP0rk/Proxima-Deploy-Script/main/proxima.sh
-less proxima.sh
-bash proxima.sh
-```
-
 The installer will ask for:
 
 1. **Registry credentials** — your Proxima community username and license key.
-2. **Component selection** — Full Stack, Backend only, or Frontend only.
+2. **Component selection** — Full Stack, Backend only, or Frontend only. **Currently Full Stack is tested working**
 3. **Backend API port** — defaults to `8443`.
 
 ---
@@ -49,7 +35,7 @@ The installer will ask for:
 | **Docker** | installed automatically if missing |
 | **Network** | outbound HTTPS to `get.docker.com`, your distro's package mirrors, and `updates.dev-proxima.com` |
 | **Disk** | ~4 GB for images and the database |
-| **Memory** | 4 GB minimum, 8 GB recommended for the full stack |
+| **Memory** | 2 GB recommended for the full stack |
 | **Credentials** | a Proxima community username + license key |
 
 ### Running inside an LXC container — nesting is required
@@ -150,6 +136,29 @@ docker compose restart       # restart everything
 docker compose down          # stop (data is preserved)
 docker compose up -d         # start again
 ```
+
+### Backend TUI
+
+The backend runs a live terminal UI for status, logs, and database inspection.
+Attach to it from the host with:
+
+```bash
+docker exec -it proxima-backend tui
+```
+
+The `-it` flags are required — it is an interactive terminal application.
+
+> **Detach with `Ctrl-\`.** Do **not** quit with `q` or `Ctrl-C`: the TUI is the
+> process the container supervises, so quitting it **stops the container** and
+> takes Proxima down with it. `Ctrl-\` leaves it running and returns you to your
+> shell.
+
+The TUI is kept alive in a detached pty, so you can attach and detach as often
+as you like without disturbing the running service. Plain-text logs stay
+available separately via `docker logs proxima-backend`.
+
+If you get `TUI socket not found`, the container has not finished starting —
+wait a moment and check `docker logs proxima-backend`.
 
 ### Updating
 
