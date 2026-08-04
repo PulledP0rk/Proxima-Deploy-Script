@@ -2,8 +2,11 @@
 set -euo pipefail
 
 # ── Proxima Installer ────────────────────────────────────────────
-# Usage: curl -s https://get.dev-proxima.com/ | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/PulledP0rk/Proxima-Deploy-Script/main/proxima.sh | bash
 # Or:    bash proxima.sh
+#
+# Must run as root. Installs Docker if it is missing. Inside an LXC the
+# container needs nesting=1, which can only be set from the Proxmox host.
 
 REGISTRY="updates.dev-proxima.com"
 INSTALL_DIR="./proxima"
