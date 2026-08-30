@@ -1,0 +1,160 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Proxima — Backend stack (API + PostgreSQL + update sidecar)
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Deploy with either:
+#
+#    docker compose -f docker-compose.backend.yml up -d
+#
+#  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
+#  Web editor) and set the variables below in the stack's
+#  "Environment variables" panel. No bind mounts and no files on disk
+#  are required — everything lives in named volumes.
+#
+#  ── Variables ──────────────────────────────────────────────────
+#    BACKEND_PORT        host port for the API            (8443)
+#    POSTGRES_USER       database user                    (proxima)
+#    POSTGRES_PASSWORD   database password                (proxima)  ← CHANGE
+#    POSTGRES_DB         database name                    (proxima_db)
+#    PROXIMA_VERSION     version label on the containers  (0.1.0)
+#    IMAGE_TAG           image tag to run                 (latest)
+#    REGISTRY_URL / REGISTRY_USERNAME / REGISTRY_PASSWORD
+#                        credentials for the update sidecar (optional)
+#    UPDATE_CHANNEL      stable | beta                    (stable)
+#    CHECK_INTERVAL_MINUTES  sidecar poll period, 0=off   (60)
+#
+#  After it comes up the API is on http://<host>:8443/api and the
+#  frontend stack points PROXIMA_BACKEND_UPSTREAM at that address.
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+  # ── PostgreSQL database ────────────────────────────────────────
+  db:
+    image: postgres:18-alpine
+    container_name: proxima-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-proxima}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-proxima}
+      POSTGRES_DB: ${POSTGRES_DB:-proxima_db}
+    volumes:
+      - db-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-proxima} -d ${POSTGRES_DB:-proxima_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - proxima-internal
+
+  # ── JWT signing keys (one-shot init) ───────────────────────────
+  # The backend signs access tokens with RS256 and reads the key pair
+  # from /app/keys (settings.jwt_private_key_path defaults to
+  # ./keys/jwt_private.pem, workdir /app). The published image ships no
+  # keys — they are per-deployment secrets — and nothing generates them
+  # at startup, so without this service login authenticates the user and
+  # then dies with HTTP 500 (FileNotFoundError: './keys/jwt_private.pem')
+  # while issuing the token.
+  #
+  # The keys live in a named volume so sessions survive a restart;
+  # deleting the volume rotates them and invalidates every issued token.
+  jwt-key-init:
+    image: alpine/openssl:latest
+    container_name: proxima-jwt-key-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -s /keys/jwt_private.pem ] || [ ! -s /keys/jwt_public.pem ]; then
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /keys/jwt_private.pem && \
+          openssl pkey -in /keys/jwt_private.pem -pubout -out /keys/jwt_public.pem && \
+          chmod 600 /keys/jwt_private.pem && \
+          chmod 644 /keys/jwt_public.pem && \
+          echo "[jwt-key-init] generated RS256 signing keypair"
+        else
+          echo "[jwt-key-init] JWT keys already present"
+        fi
+    volumes:
+      - jwt-keys:/keys
+    networks:
+      - proxima-internal
+
+  # ── Backend API server ─────────────────────────────────────────
+  backend:
+    image: updates.dev-proxima.com/proxima-backend/app:${IMAGE_TAG:-latest}
+    container_name: proxima-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      jwt-key-init:
+        condition: service_completed_successfully
+    ports:
+      # Plain HTTP on 8443. Put it behind the Proxima frontend (which
+      # terminates TLS and proxies /api + /ws) or your own reverse proxy;
+      # do not expose this port to the internet directly.
+      - "${BACKEND_PORT:-8443}:8443"
+    environment:
+      - PD_FRONTEND_ORIGINS=${PD_FRONTEND_ORIGINS:-*}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=${POSTGRES_USER:-proxima}
+      - DB_PASS=${POSTGRES_PASSWORD:-proxima}
+      - DB_NAME=${POSTGRES_DB:-proxima_db}
+      - SIDECAR_URL=http://sidecar:9009
+      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
+      # Themes and branding uploaded through the web UI are written here
+      # and served by the frontend from its own copy of these volumes.
+      - FRONTEND_DIST_PATH=/shared-assets
+    volumes:
+      - backend-secrets:/app/data
+      - jwt-keys:/app/keys
+      - themes-data:/shared-assets/themes
+      - branding-data:/shared-assets/branding
+    labels:
+      - "proxima.managed=true"
+      - "proxima.component=backend"
+      - "proxima.version=${PROXIMA_VERSION:-0.1.0}"
+    networks:
+      - proxima-net
+      - proxima-internal
+
+  # ── Update sidecar ─────────────────────────────────────────────
+  # Polls the registry and applies new images. Set
+  # CHECK_INTERVAL_MINUTES=0 to disable the poll, or delete this
+  # service entirely if you manage updates yourself.
+  sidecar:
+    image: updates.dev-proxima.com/proxima-sidecar/app:${IMAGE_TAG:-latest}
+    container_name: proxima-sidecar
+    restart: unless-stopped
+    environment:
+      - REGISTRY_URL=${REGISTRY_URL:-}
+      - REGISTRY_USERNAME=${REGISTRY_USERNAME:-}
+      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-}
+      - FRONTEND_IMAGE=${FRONTEND_IMAGE:-proxima-frontend/app}
+      - BACKEND_IMAGE=${BACKEND_IMAGE:-proxima-backend/app}
+      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
+      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
+      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
+    volumes:
+      # Required: the sidecar pulls and re-creates containers through
+      # the Docker API. Drop this service if that is not acceptable.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sidecar-state:/data
+    networks:
+      - proxima-internal
+
+networks:
+  # Reachable from the host / the frontend stack.
+  proxima-net:
+  # No egress and no external reachability — db, keys and sidecar chatter.
+  proxima-internal:
+    internal: true
+
+volumes:
+  db-data:
+  jwt-keys:
+  backend-secrets:
+  sidecar-state:
+  themes-data:
+  branding-data:

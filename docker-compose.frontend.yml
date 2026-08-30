@@ -1,0 +1,134 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Proxima — Frontend stack (SPA + TLS edge + update sidecar)
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Deploy with either:
+#
+#    PROXIMA_BACKEND_UPSTREAM=http://10.0.0.5:8443 \
+#      docker compose -f docker-compose.frontend.yml up -d
+#
+#  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
+#  Web editor) and set the variables below in the stack's
+#  "Environment variables" panel. No bind mounts and no files on disk
+#  are required — everything lives in named volumes.
+#
+#  ── Variables ──────────────────────────────────────────────────
+#    PROXIMA_BACKEND_UPSTREAM   REQUIRED. Where NGINX proxies /api and
+#                               /ws, e.g. http://10.0.0.5:8443. Must be
+#                               reachable from inside this container.
+#    WEBUI_PORT                 host port for the UI          (8086)
+#    PROXIMA_PUBLIC_HOSTNAME    CN/SAN of the self-signed cert (localhost)
+#    PROXIMA_VERSION            version label                 (0.1.0)
+#    IMAGE_TAG                  image tag to run              (latest)
+#    REGISTRY_URL / REGISTRY_USERNAME / REGISTRY_PASSWORD
+#                               credentials for the update sidecar (optional)
+#    UPDATE_CHANNEL             stable | beta                 (stable)
+#    CHECK_INTERVAL_MINUTES     sidecar poll period, 0=off    (60)
+#
+#  The UI is then on https://<host>:8086 (self-signed cert on first
+#  boot; mount your own at /etc/nginx/certs/public.{pem,key} to
+#  override). The browser only ever talks to this host — /api and /ws
+#  are proxied server-side, so an absolute http:// API URL is never
+#  needed and never blocked as mixed content.
+# ═══════════════════════════════════════════════════════════════════
+
+services:
+  # ── Frontend SPA (NGINX) ───────────────────────────────────────
+  frontend:
+    image: updates.dev-proxima.com/proxima-frontend/app:${IMAGE_TAG:-latest}
+    container_name: proxima-frontend
+    restart: unless-stopped
+    ports:
+      # The SPA is served over HTTPS on container port 8086. Container
+      # port 80 is a redirect-only server block (301 -> https://$$host),
+      # so mapping the host port to :80 would bounce browsers to an
+      # unpublished :443.
+      - "${WEBUI_PORT:-8086}:8086"
+    environment:
+      - PROXIMA_SECURITY_MODE=standalone
+      - PROXIMA_PUBLIC_HOSTNAME=${PROXIMA_PUBLIC_HOSTNAME:-localhost}
+      # Same-origin API: NGINX proxies /api + /ws to the backend.
+      - VITE_API_URL=/api
+      - PROXIMA_BACKEND_UPSTREAM=${PROXIMA_BACKEND_UPSTREAM:?set PROXIMA_BACKEND_UPSTREAM to the backend URL, e.g. http://10.0.0.5:8443}
+    # ── Backend upstream patch ─────────────────────────────────
+    # The stock image ships nginx-standalone.conf with
+    #
+    #     set $$proxima_backend_upstream "https://backend-nginx:8443";
+    #
+    # hardcoded — that is the mTLS terminator used by the full Proxima
+    # compose, which does not exist in this topology, and the backend
+    # image speaks plain HTTP on 8443. Left alone, every /api and /ws
+    # request fails first on DNS and then on the TLS handshake.
+    #
+    # The installer fixes this with a bind-mounted hook script, which a
+    # Portainer stack cannot do (there are no files on the host), so the
+    # rewrite is inlined here instead: patch the config TEMPLATE, then
+    # hand off to the image's real entrypoint, which copies the template
+    # into place and starts NGINX. Matching is by literal substring
+    # (awk index) — the upstream value contains '/' and '.' and must
+    # never be treated as a pattern.
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        TPL=/etc/nginx/templates/nginx-standalone.conf
+        if [ -n "$${PROXIMA_BACKEND_UPSTREAM:-}" ] && [ -f "$$TPL" ]; then
+          awk -v up="$$PROXIMA_BACKEND_UPSTREAM" '
+              index($$0, "set $$proxima_backend_upstream") {
+                  print "    set $$proxima_backend_upstream \"" up "\";"
+                  next
+              }
+              { print }
+          ' "$$TPL" > "$$TPL.new" && mv "$$TPL.new" "$$TPL"
+          echo "[proxima] backend upstream -> $$PROXIMA_BACKEND_UPSTREAM"
+        fi
+        exec /sbin/tini -- /proxima-entrypoint.sh nginx -g "daemon off;"
+    volumes:
+      # Themes and branding uploaded through the web UI. On a split
+      # deployment these are local to the frontend host; the built-in
+      # themes are re-seeded from the image on every boot.
+      - themes-data:/usr/share/nginx/html/themes
+      - branding-data:/usr/share/nginx/html/branding
+      # Uncomment to keep the self-signed cert across container
+      # re-creation, or to mount your own public.pem / public.key.
+      # - frontend-certs:/etc/nginx/certs
+    labels:
+      - "proxima.managed=true"
+      - "proxima.component=frontend"
+      - "proxima.version=${PROXIMA_VERSION:-0.1.0}"
+    networks:
+      - proxima-net
+
+  # ── Update sidecar ─────────────────────────────────────────────
+  # Polls the registry and applies new images. Set
+  # CHECK_INTERVAL_MINUTES=0 to disable the poll, or delete this
+  # service entirely if you manage updates yourself.
+  sidecar:
+    image: updates.dev-proxima.com/proxima-sidecar/app:${IMAGE_TAG:-latest}
+    container_name: proxima-sidecar
+    restart: unless-stopped
+    environment:
+      - REGISTRY_URL=${REGISTRY_URL:-}
+      - REGISTRY_USERNAME=${REGISTRY_USERNAME:-}
+      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-}
+      - FRONTEND_IMAGE=${FRONTEND_IMAGE:-proxima-frontend/app}
+      - BACKEND_IMAGE=${BACKEND_IMAGE:-proxima-backend/app}
+      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
+      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
+      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
+    volumes:
+      # Required: the sidecar pulls and re-creates containers through
+      # the Docker API. Drop this service if that is not acceptable.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sidecar-state:/data
+    networks:
+      - proxima-net
+
+networks:
+  proxima-net:
+
+volumes:
+  sidecar-state:
+  themes-data:
+  branding-data:
+  # frontend-certs:
