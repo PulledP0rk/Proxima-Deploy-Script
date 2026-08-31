@@ -33,27 +33,72 @@ on:
 jobs:
   drift:
     runs-on: ubuntu-latest
+    # Pull requests from forks get no secrets, so the cross-repo
+    # checkouts below could never succeed there. Skip rather than fail.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout deploy scripts
         uses: actions/checkout@v4
         with:
           path: Proxima-Deploy-Script
 
+      # actions/checkout rejects an EMPTY `token` input with
+      #   "Error: Input required and not supplied: token"
+      # which names neither the secret nor the reason. Fail here first,
+      # with something actionable.
+      - name: Preflight — cross-repo token is present
+        env:
+          TOKEN: ${{ secrets.REPO_SYNC_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "REPO_SYNC_TOKEN is set."
+            exit 0
+          fi
+          echo "::error::REPO_SYNC_TOKEN is not set on this repository."
+          cat <<'MSG'
+
+          This job renders the deploy composes FROM the source composes in
+          Proxima-Backend and Proxima-Frontend, so it has to check both out.
+          The built-in GITHUB_TOKEN only grants access to THIS repository,
+          so a cross-repo token is required.
+
+          To fix:
+            1. Create a fine-grained personal access token with
+               Repository access -> Only select repositories:
+                   <owner>/Proxima-Backend
+                   <owner>/Proxima-Frontend
+               Permissions -> Repository permissions -> Contents: Read-only
+            2. Add it to THIS repo under
+               Settings -> Secrets and variables -> Actions ->
+               New repository secret, named exactly:
+                   REPO_SYNC_TOKEN
+
+          (The same pattern the frontend repo already uses for
+           DEMO_SYNC_TOKEN.)
+          MSG
+          exit 1
+
       # The renderer resolves the source composes as SIBLINGS of this
       # repo, matching a local working copy, so both are checked out
       # next to it rather than underneath it.
+      #
+      # The `|| github.token` fallback keeps the failure legible if the
+      # secret is ever removed: checkout then reports a missing/denied
+      # repository instead of the bare "input required" above.
       - name: Checkout Proxima-Backend
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/Proxima-Backend
-          token: ${{ secrets.REPO_SYNC_TOKEN }}
+          token: ${{ secrets.REPO_SYNC_TOKEN || github.token }}
           path: Proxima-Backend
 
       - name: Checkout Proxima-Frontend
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/Proxima-Frontend
-          token: ${{ secrets.REPO_SYNC_TOKEN }}
+          token: ${{ secrets.REPO_SYNC_TOKEN || github.token }}
           path: Proxima-Frontend
 
       - uses: actions/setup-node@v4
