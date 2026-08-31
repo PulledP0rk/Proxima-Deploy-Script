@@ -4,23 +4,29 @@
 #
 #  Deploy with either:
 #
-#    COMPOSE_PROFILES=infisical docker compose -f docker-compose.backend.yml up -d
+#    docker compose -f docker-compose.backend.yml up -d
 #
 #  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
 #  Web editor) and set the variables below in the stack's
-#  "Environment variables" panel. There are no bind mounts and no
-#  files on disk to prepare — everything lives in named volumes.
+#  "Environment variables" panel. There are no bind mounts, no files
+#  on disk to prepare, and no compose profile to remember —
+#  everything lives in named volumes and every service starts.
 #
-#  ── The infisical profile is REQUIRED ──────────────────────────
-#    Set COMPOSE_PROFILES=infisical (Portainer: add it as a stack
-#    environment variable). Without it the infisical, valkey and
-#    bootstrap services never start, and:
+#  ── Every service here is REQUIRED ─────────────────────────────
+#    Infisical, Valkey and the two one-shots are not optional extras.
+#    They used to sit behind a compose profile, which was a trap: the
+#    apps default to `infisical` security mode but a profile is never
+#    active by default, so the stack came up in a state that cannot
+#    work. If any of them is removed:
 #
 #      * src/services/secret_resolver.py has NO local fallback — the
 #        Fernet-on-disk path was removed in May 2026 — so adding a
 #        Proxmox server raises SecretStoreUnavailable. The tell is a
 #        server row that saves and lists fine while the sidebar
 #        resource tree stays empty.
+#      * backend-nginx dies on boot with
+#        "[cert-fetcher] FATAL: INFISICAL_CERT_TEMPLATE_ID not set" —
+#        the bootstrap one-shot writes that id into the shared volume.
 #      * is_token_blacklisted() returns False, so signing out does
 #        not revoke a token; it stays valid until it expires.
 #      * check_rate_limit() returns (True, max), so the login (5/15m),
@@ -61,7 +67,6 @@
 #    compose-drift workflow re-checks every third-party pin.
 #
 #  ── Variables ──────────────────────────────────────────────────
-#    COMPOSE_PROFILES   MUST be `infisical` (see above)
 #    BACKEND_PORT       host port for the API             (8443)
 #    AGENT_PORT         host port for the agent listener  (8444)
 #    INFISICAL_UI_PORT  host port for the Infisical UI    (8088)

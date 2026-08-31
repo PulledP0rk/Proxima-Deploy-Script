@@ -117,7 +117,6 @@ jobs:
         env:
           INFISICAL_BOOTSTRAP_EMAIL: ci@example.invalid
           INFISICAL_BOOTSTRAP_PASSWORD: ci-placeholder
-          COMPOSE_PROFILES: infisical
         run: |
           docker compose -f docker-compose.backend.yml config --quiet
           docker compose -f docker-compose.frontend.yml config --quiet

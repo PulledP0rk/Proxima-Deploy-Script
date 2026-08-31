@@ -19,23 +19,29 @@
 #
 #  Deploy with either:
 #
-#    COMPOSE_PROFILES=infisical docker compose -f docker-compose.backend.yml up -d
+#    docker compose -f docker-compose.backend.yml up -d
 #
 #  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
 #  Web editor) and set the variables below in the stack's
-#  "Environment variables" panel. There are no bind mounts and no
-#  files on disk to prepare — everything lives in named volumes.
+#  "Environment variables" panel. There are no bind mounts, no files
+#  on disk to prepare, and no compose profile to remember —
+#  everything lives in named volumes and every service starts.
 #
-#  ── The infisical profile is REQUIRED ──────────────────────────
-#    Set COMPOSE_PROFILES=infisical (Portainer: add it as a stack
-#    environment variable). Without it the infisical, valkey and
-#    bootstrap services never start, and:
+#  ── Every service here is REQUIRED ─────────────────────────────
+#    Infisical, Valkey and the two one-shots are not optional extras.
+#    They used to sit behind a compose profile, which was a trap: the
+#    apps default to `infisical` security mode but a profile is never
+#    active by default, so the stack came up in a state that cannot
+#    work. If any of them is removed:
 #
 #      * src/services/secret_resolver.py has NO local fallback — the
 #        Fernet-on-disk path was removed in May 2026 — so adding a
 #        Proxmox server raises SecretStoreUnavailable. The tell is a
 #        server row that saves and lists fine while the sidebar
 #        resource tree stays empty.
+#      * backend-nginx dies on boot with
+#        "[cert-fetcher] FATAL: INFISICAL_CERT_TEMPLATE_ID not set" —
+#        the bootstrap one-shot writes that id into the shared volume.
 #      * is_token_blacklisted() returns False, so signing out does
 #        not revoke a token; it stays valid until it expires.
 #      * check_rate_limit() returns (True, max), so the login (5/15m),
@@ -76,7 +82,6 @@
 #    compose-drift workflow re-checks every third-party pin.
 #
 #  ── Variables ──────────────────────────────────────────────────
-#    COMPOSE_PROFILES   MUST be `infisical` (see above)
 #    BACKEND_PORT       host port for the API             (8443)
 #    AGENT_PORT         host port for the agent listener  (8444)
 #    INFISICAL_UI_PORT  host port for the Infisical UI    (8088)
@@ -122,40 +127,48 @@
 
 # ── Proxima Backend — Docker Compose ────────────────────────────
 #
-# Runs the backend API server, PostgreSQL, and (optionally) a
-# self-hosted Infisical + Valkey pair behind the DMZ.
+# Runs the backend API server, PostgreSQL, and the self-hosted
+# Infisical + Valkey pair behind the DMZ. None of it is optional —
+# see SECURITY MODE below.
 #
 # Usage:
 #   cp .env.example .env              # edit as needed
-#   ./proxima-compose.ps1 up -d       # auto-detects security mode
+#   docker compose up -d
 #
 # On first boot the entrypoint auto-generates secrets.json from the
 # DB_* env vars — no manual setup required.
 
 # ════════════════════════════════════════════════════════════════
-#  SECURITY MODE — uncomment EXACTLY ONE of the two blocks below.
+#  SECURITY MODE — there is exactly one, and it needs no opting in.
 #
-#  The wrapper scripts (proxima-compose.ps1 / proxima-compose.sh)
-#  read the active anchor and set COMPOSE_PROFILES automatically.
-#  Manual operators should run with:
-#       PowerShell:  $env:COMPOSE_PROFILES = "infisical"
-#       bash:        export COMPOSE_PROFILES=infisical
-#  (no profile is needed for `standalone`.)
+#  `infisical` is the only supported posture: src/core/security_mode.py
+#  raises at process start on any other value, and the legacy
+#  `standalone` (Fernet-on-disk) mode was removed because a host breach
+#  would expose every Proxmox credential at once.
 #
-#  See README.md § "Security Modes" for the full reference.
+#  These services therefore carry NO compose profile. They used to sit
+#  behind `profiles: ["infisical"]`, which was a trap: the security-mode
+#  env defaults to `infisical` but a profile is NEVER active by default,
+#  so a plain `docker compose up -d` — or a Portainer stack, where
+#  setting COMPOSE_PROFILES is easy to miss — started the apps in
+#  infisical mode with no infisical, no valkey and no bootstrap. The
+#  visible symptom was backend-nginx dying on
+#
+#      [cert-fetcher] FATAL: INFISICAL_CERT_TEMPLATE_ID not set and
+#      /etc/proxima/infisical-secrets/cert_template_id missing
+#
+#  and `depends_on: {required: false}` meant compose SKIPPED the missing
+#  dependency rather than complaining. A configuration that cannot work
+#  should not be reachable, so the profile is gone.
+#
+#  To point at an Infisical that runs on ANOTHER host (recommended when
+#  this stack holds production credentials — one host compromise then no
+#  longer reaches both the wrapping key and the ciphertext): delete the
+#  `infisical` service below and set INFISICAL_API_URL to its address.
+#  The bootstrap one-shot still runs, against that remote instance.
 # ════════════════════════════════════════════════════════════════
 
 # ── Security mode env (shared by all app services) ────────────
-# Only `infisical` is supported. Setting any other value will cause
-# the backend to refuse to start. The legacy `standalone` mode
-# (Fernet on disk) was removed because a host breach would expose
-# every Proxmox server credential at once.
-#
-# The matching compose profile must be active so the
-# infisical/valkey/bootstrap services start:
-#   pwsh:  $env:COMPOSE_PROFILES = 'infisical'
-#   bash:  export COMPOSE_PROFILES=infisical
-# (the proxima-compose.ps1 wrapper does this automatically.)
 x-security-env: &security-env
   PROXIMA_SECURITY_MODE: ${PROXIMA_SECURITY_MODE:-infisical}
 
@@ -200,7 +213,6 @@ services:
     image: postgres:18-alpine
     container_name: proxima-db-init
     restart: "no"
-    profiles: ["infisical"]
     depends_on:
       db:
         condition: service_healthy
@@ -218,12 +230,10 @@ services:
       - proxima-internal
 
   # ── Valkey (Redis-compatible cache for Infisical sessions) ──
-  # Activated in `infisical` mode only.
   valkey:
     image: valkey/valkey:8-alpine
     container_name: proxima-valkey
     restart: unless-stopped
-    profiles: ["infisical"]
     command:
       - valkey-server
       - --appendonly
@@ -241,7 +251,7 @@ services:
       - proxima-internal
 
   # ── Infisical (self-hosted secrets manager + PKI) ───────────
-  # Activated in `infisical` mode only. Holds:
+  # Holds:
   #   * application secrets (KV)
   #   * an internal CA + certificate templates for mTLS between
   #     frontend-nginx and backend-nginx
@@ -251,7 +261,6 @@ services:
     image: infisical/infisical:v0.159.25
     container_name: proxima-infisical
     restart: unless-stopped
-    profiles: ["infisical"]
     depends_on:
       db:
         condition: service_healthy
@@ -296,13 +305,12 @@ services:
   # Outputs:
   #   * named volume `infisical-backend-secrets` -> consumed by
   #     backend-nginx as /etc/proxima/infisical-secrets (read-only)
-  #   * host bind   `./scripts/infisical/output/frontend-bundle/`
-  #     -> operator copies this directory's contents to the (DMZ-
-  #     separated) frontend host as Proxima-Frontend/infisical-secrets/
+  #   * named volume `infisical-frontend-bundle` -> the operator copies
+  #     it across to the (DMZ-separated) frontend host with `docker cp`;
+  #     see that volume's note at the bottom of this file
   infisical-bootstrap:
     image: ${REGISTRY_HOST:-updates.dev-proxima.com}/proxima-infisical-bootstrap/app:${IMAGE_TAG:-latest}
     container_name: proxima-infisical-bootstrap
-    profiles: ["infisical"]
     restart: "no"
     depends_on:
       infisical:
@@ -336,22 +344,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      # Valkey connection is a one-shot at startup with no reconnect, so wait
-      # for it to be healthy first (required:false → skipped if profile off).
+      # Valkey connection is a one-shot at startup with no reconnect, so
+      # wait for it to be healthy first. Without it, token revocation and
+      # rate limiting silently FAIL OPEN — see the VALKEY_URL note below.
       valkey:
         condition: service_healthy
-        required: false
-      # In `infisical` mode wait for Infisical and the one-shot
-      # bootstrap to finish before booting -- the backend reads the
-      # Machine Identity bundle and the `proxima-config` workspace
-      # pointers at startup. The dependency is silently skipped in
-      # `standalone` mode (infisical profile inactive).
+      # Wait for Infisical and the one-shot bootstrap before booting --
+      # the backend reads the Machine Identity bundle and the
+      # `proxima-config` workspace pointers at startup. These are hard
+      # dependencies: nothing here works without a reachable secret store.
       infisical:
         condition: service_healthy
-        required: false
       infisical-bootstrap:
         condition: service_completed_successfully
-        required: false
       # Provisioner keypair for RDP gateway tokens is generated once by this
       # one-shot into a shared volume before the backend reads it.
       rdp-key-init:
@@ -461,13 +466,11 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-      # In `infisical` mode wait for the bootstrap one-shot to finish
-      # populating the secrets volume. In `standalone` mode the
-      # `infisical` profile isn't active so this dependency is
-      # silently skipped by compose.
+      # Wait for the bootstrap one-shot to finish populating the secrets
+      # volume. Without it the cert fetcher has no cert_template_id and
+      # nginx dies on boot -- a hard dependency, never a skippable one.
       infisical-bootstrap:
         condition: service_completed_successfully
-        required: false
     ports:
       - "${BACKEND_PORT:-8443}:8443"
       # Agent-only TLS listener (no mTLS) — the in-LXC Docker agent authenticates
@@ -484,9 +487,7 @@ services:
       - backend-nginx-certs:/etc/nginx/certs
       - backend-nginx-cert-state:/var/lib/proxima/cert-state
       # Machine Identity bundle (client_id, client_secret, ca_id,
-      # cert_template_id) populated by the infisical-bootstrap
-      # one-shot. Empty in `standalone` mode (the entrypoint does
-      # not touch this volume).
+      # cert_template_id) populated by the infisical-bootstrap one-shot.
       - infisical-backend-secrets:/etc/proxima/infisical-secrets:ro
     labels:
       - "proxima.managed=true"
@@ -606,7 +607,7 @@ volumes:
   # backend-nginx state.
   backend-nginx-certs:
   backend-nginx-cert-state:
-  # Infisical / Valkey volumes -- only used when COMPOSE_PROFILES=infisical.
+  # Infisical / Valkey volumes.
   valkey-data:
   # Machine Identity bundle for backend-nginx (and backend) -- written
   # by the infisical-bootstrap one-shot, read-only from the apps.
