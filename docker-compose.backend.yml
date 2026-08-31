@@ -336,6 +336,46 @@ services:
     networks:
       - proxima-internal
 
+  # ── JWT signing key init (one-shot) ─────────────────────────
+  # Generates the RS256 keypair the API signs access tokens with, into
+  # a volume mounted at /app/keys.
+  #
+  # This MUST be a RUNTIME step, and the volume must shadow whatever the
+  # image happens to contain. `keys/` is gitignored, so a local build
+  # bakes the developer's keypair into the image while CI's clean
+  # checkout produces an image with none -- the stack then works on the
+  # machine that built it and fails everywhere else with
+  #
+  #     FileNotFoundError: [Errno 2] No such file or directory:
+  #     './keys/jwt_private.pem'
+  #
+  # on POST /api/auth/login, and ONLY on login, so health checks stay
+  # green and every container reports healthy.
+  #
+  # Shipping a keypair in the image would be worse than the bug: every
+  # install would share one signing key, so a token minted against any
+  # deployment would authenticate against all of them.
+  jwt-key-init:
+    image: alpine/openssl:latest
+    container_name: proxima-jwt-key-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -s /keys/jwt_private.pem ] || [ ! -s /keys/jwt_public.pem ]; then
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /keys/jwt_private.pem && \
+          openssl pkey -in /keys/jwt_private.pem -pubout -out /keys/jwt_public.pem && \
+          chmod 600 /keys/jwt_private.pem && \
+          chmod 644 /keys/jwt_public.pem && \
+          echo "[jwt-key-init] generated RS256 signing keypair"
+        else
+          echo "[jwt-key-init] JWT keys already present"
+        fi
+    volumes:
+      - jwt-keys:/keys
+    networks:
+      - proxima-internal
+
   # ── Backend API Server ──────────────────────────────────────
   backend:
     image: ${REGISTRY_HOST:-updates.dev-proxima.com}/proxima-backend/app:${IMAGE_TAG:-latest}
@@ -360,6 +400,9 @@ services:
       # Provisioner keypair for RDP gateway tokens is generated once by this
       # one-shot into a shared volume before the backend reads it.
       rdp-key-init:
+        condition: service_completed_successfully
+      # RS256 token-signing keypair. Without it every login 500s.
+      jwt-key-init:
         condition: service_completed_successfully
     expose:
       - "8443"
@@ -449,6 +492,10 @@ services:
       - infisical-backend-secrets:/etc/proxima/infisical-secrets
       # RDP provisioner private key (shared with the gateway one-shot).
       - rdp-provisioner:/etc/proxima/rdp:ro
+      # RS256 token-signing keypair from jwt-key-init. This deliberately
+      # SHADOWS anything the image carries at /app/keys -- see that
+      # service's note on why a baked-in keypair must never be trusted.
+      - jwt-keys:/app/keys
     command: ["/docker-supervisor.sh", "--uds", "/run/proxima/app.sock"]
     labels:
       - "proxima.managed=true"
@@ -547,6 +594,21 @@ services:
       # gateway names itself after a hash that changes on every recreate.
       HOSTNAME: proxima-rdp-gateway
       WEB_PORT: "7171"
+      # REQUIRED ON arm64. The gateway's entrypoint is a PowerShell
+      # script, and .NET refuses to start without ICU:
+      #
+      #   Process terminated. Couldn't find a valid ICU package installed
+      #   on the system... at Microsoft.PowerShell.ManagedPSEntry.Main
+      #
+      # Upstream's amd64 image ships libicu; the arm64 image ships NONE
+      # (verified: 12 ICU files vs 0). So the stock image cannot boot on
+      # a Pi at all — this is not caused by our entrypoint override.
+      #
+      # Invariant mode is upstream's own documented alternative and only
+      # affects the entrypoint script's culture data; the gateway binary
+      # itself is Rust and is unaffected. Set unconditionally so ONE file
+      # serves both architectures (see CLAUDE.md § Cross-architecture).
+      DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
       # Parity with the hand-written gateway.json this replaced, which
       # declared only the web listener. RDCleanPath (the browser's IronRDP
       # client) rides the web listener; the raw TCP listener on 8181 was
@@ -618,6 +680,9 @@ volumes:
   # Written by infisical-bootstrap; the operator copies it out with
   # `docker cp proxima-infisical-bootstrap:/var/lib/proxima/frontend-bundle ./`.
   infisical-frontend-bundle:
+  # RS256 JWT signing keypair, generated on first boot by jwt-key-init.
+  # MUST persist: recreating it invalidates every existing session.
+  jwt-keys:
   # RDP gateway provisioner keypair (private → backend, public → gateway).
   rdp-provisioner:
   # Devolutions Gateway writable state: logs, job/audit databases, and
