@@ -105,7 +105,7 @@ BANNER
 # ── Detect Existing Installation ─────────────────────────────────
 detect_existing() {
     local found=0
-    local containers=("proxima-frontend" "proxima-backend" "proxima-db" "proxima-sidecar")
+    local containers=("proxima-frontend" "proxima-backend" "proxima-db")
 
     # Check if docker is available before scanning
     if ! command -v docker &>/dev/null; then
@@ -330,7 +330,7 @@ select_components() {
     printf "${C_DIM}  │       Connects to a remote backend API      │${C_RESET}\n"
     printf "${C_WHITE}  │                                             │${C_RESET}\n"
     printf "${C_WHITE}  │  ${C_CYAN}[2]${C_WHITE}  Backend Only                        │${C_RESET}\n"
-    printf "${C_DIM}  │       API + Database + Sidecar               │${C_RESET}\n"
+    printf "${C_DIM}  │       API + Database + Secrets               │${C_RESET}\n"
     printf "${C_DIM}  │       API exposed on :8443                   │${C_RESET}\n"
     printf "${C_WHITE}  │                                             │${C_RESET}\n"
     printf "${C_WHITE}  │  ${C_CYAN}[3]${C_WHITE}  Full Stack ${C_GREEN}(Recommended)${C_WHITE}            │${C_RESET}\n"
@@ -469,20 +469,10 @@ POSTGRES_USER=proxima
 POSTGRES_PASSWORD=${pg_pass}
 POSTGRES_DB=proxima_db
 
-# Container Registry (for sidecar auto-updates)
+# Container Registry (for the notify-only update check)
 REGISTRY_URL=${REGISTRY}
 REGISTRY_USERNAME=${REGISTRY_USER}
 REGISTRY_PASSWORD=${REGISTRY_PASS}
-
-# Image names
-FRONTEND_IMAGE=proxima-frontend/app
-BACKEND_IMAGE=proxima-backend/app
-
-# Release channel: stable | beta
-UPDATE_CHANNEL=stable
-
-# How often the sidecar checks for new tags (minutes, 0 to disable)
-CHECK_INTERVAL_MINUTES=60
 
 # Version label
 PROXIMA_VERSION=${VERSION}
@@ -566,32 +556,11 @@ services:
     networks:
       - proxima-net
 
-  # ── Update Sidecar ─────────────────────────────────────────
-  sidecar:
-    image: updates.dev-proxima.com/proxima-sidecar/app:latest
-    container_name: proxima-sidecar
-    restart: unless-stopped
-    environment:
-      - REGISTRY_URL=\${REGISTRY_URL:-}
-      - REGISTRY_USERNAME=\${REGISTRY_USERNAME:-}
-      - REGISTRY_PASSWORD=\${REGISTRY_PASSWORD:-}
-      - FRONTEND_IMAGE=\${FRONTEND_IMAGE:-proxima-frontend/app}
-      - BACKEND_IMAGE=\${BACKEND_IMAGE:-proxima-backend/app}
-      - UPDATE_CHANNEL=\${UPDATE_CHANNEL:-stable}
-      - CHECK_INTERVAL_MINUTES=\${CHECK_INTERVAL_MINUTES:-60}
-      - PROXIMA_VERSION=\${PROXIMA_VERSION:-0.1.0}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - sidecar-state:/data
-    networks:
-      - proxima-net
-
 networks:
   proxima-net:
     name: proxima-net
 
 volumes:
-  sidecar-state:
   themes-data:
   branding-data:
 COMPEOF
@@ -643,7 +612,6 @@ services:
       - DB_USER=${POSTGRES_USER:-proxima}
       - DB_PASS=${POSTGRES_PASSWORD:-proxima}
       - DB_NAME=${POSTGRES_DB:-proxima_db}
-      - SIDECAR_URL=http://sidecar:9009
       - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
       - FRONTEND_DIST_PATH=/shared-assets
     volumes:
@@ -690,26 +658,6 @@ services:
     networks:
       - proxima-internal
 
-  # ── Update Sidecar ─────────────────────────────────────────
-  sidecar:
-    image: updates.dev-proxima.com/proxima-sidecar/app:latest
-    container_name: proxima-sidecar
-    restart: unless-stopped
-    environment:
-      - REGISTRY_URL=${REGISTRY_URL:-}
-      - REGISTRY_USERNAME=${REGISTRY_USERNAME:-}
-      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-}
-      - FRONTEND_IMAGE=${FRONTEND_IMAGE:-proxima-frontend/app}
-      - BACKEND_IMAGE=${BACKEND_IMAGE:-proxima-backend/app}
-      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
-      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
-      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - sidecar-state:/data
-    networks:
-      - proxima-internal
-
 networks:
   proxima-net:
     name: proxima-net
@@ -719,7 +667,6 @@ networks:
 
 volumes:
   db-data:
-  sidecar-state:
   backend-secrets:
   jwt-keys:
   themes-data:
@@ -774,7 +721,6 @@ services:
       - DB_USER=${POSTGRES_USER:-proxima}
       - DB_PASS=${POSTGRES_PASSWORD:-proxima}
       - DB_NAME=${POSTGRES_DB:-proxima_db}
-      - SIDECAR_URL=http://sidecar:9009
       - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
       - FRONTEND_DIST_PATH=/shared-assets
     volumes:
@@ -850,26 +796,6 @@ services:
     networks:
       - proxima-net
 
-  # ── Update Sidecar ─────────────────────────────────────────
-  sidecar:
-    image: updates.dev-proxima.com/proxima-sidecar/app:latest
-    container_name: proxima-sidecar
-    restart: unless-stopped
-    environment:
-      - REGISTRY_URL=${REGISTRY_URL:-}
-      - REGISTRY_USERNAME=${REGISTRY_USERNAME:-}
-      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-}
-      - FRONTEND_IMAGE=${FRONTEND_IMAGE:-proxima-frontend/app}
-      - BACKEND_IMAGE=${BACKEND_IMAGE:-proxima-backend/app}
-      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
-      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
-      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - sidecar-state:/data
-    networks:
-      - proxima-internal
-
 networks:
   proxima-net:
     name: proxima-net
@@ -879,7 +805,6 @@ networks:
 
 volumes:
   db-data:
-  sidecar-state:
   backend-secrets:
   jwt-keys:
   themes-data:

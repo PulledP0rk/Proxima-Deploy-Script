@@ -1,0 +1,66 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Proxima — Frontend stack (SPA + NGINX TLS terminator)
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Deploy with either:
+#
+#    docker compose -f docker-compose.frontend.yml up -d
+#
+#  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
+#  Web editor) and set the variables below in the stack's
+#  "Environment variables" panel. No bind mounts, no files on disk.
+#
+#  Log in to the private registry on the Docker host FIRST — see the
+#  note at the top of docker-compose.backend.yml.
+#
+#  The browser only ever talks to this stack; /api and /ws are proxied
+#  server-side, so an absolute http:// API URL is never needed and
+#  never blocked as mixed content.
+#
+#  ── Same host as the backend, or a different one? ──────────────
+#    CO-LOCATED (default): leave PROXIMA_BACKEND_UPSTREAM unset. NGINX
+#    proxies to https://backend-nginx:8443 over proxima-net, which the
+#    backend stack creates.
+#
+#    SPLIT / DMZ: set PROXIMA_BACKEND_UPSTREAM to the backend's
+#    published address (e.g. https://10.0.0.5:8443) and, on this host,
+#    create the network the compose expects to join:
+#
+#      docker network create proxima-internal
+#
+#    It stays empty here — the frontend's cert fetcher reaches
+#    Infisical over INFISICAL_API_URL instead — but the stack declares
+#    it `external` and will not start without it.
+#
+#  ── Machine Identity bundle (mTLS mode) ────────────────────────
+#    The frontend presents a client certificate to backend-nginx, and
+#    fetches it with credentials the BACKEND stack's bootstrap issued.
+#    Load them into this host's volume once (see the note on the
+#    infisical-frontend-secrets mount below). Until you do, the cert
+#    fetcher has no identity and the mTLS handshake fails.
+#
+#  ── Architecture ───────────────────────────────────────────────
+#    EVERY image here is a multi-arch manifest list (amd64 + arm64),
+#    with no exceptions, so one tag resolves correctly on a Raspberry
+#    Pi or an Ampere box and no `platform:` key is needed.
+#
+#  ── Updates are notify-only ────────────────────────────────────
+#    There is no auto-updater in this stack. To apply a new release:
+#
+#      docker compose -f docker-compose.frontend.yml pull
+#      docker compose -f docker-compose.frontend.yml up -d
+#
+#  ── Variables ──────────────────────────────────────────────────
+#    WEBUI_PORT            host port for the web UI          (8086)
+#    HTTP_REDIRECT_PORT    host port for the 80→443 redirect (80)
+#    PROXIMA_PUBLIC_HOSTNAME  hostname on the public cert    (localhost)
+#    PROXIMA_BACKEND_UPSTREAM  split deployments only, see above
+#    PROXIMA_ACME_DOMAIN / _EMAIL   Let's Encrypt, optional
+#    INFISICAL_API_URL     reachable Infisical base URL
+#    INFISICAL_FRONTEND_CERT_TEMPLATE_ID / INFISICAL_CA_ID
+#                          from the backend bootstrap's output
+#    REGISTRY_HOST         registry to pull from  (updates.dev-proxima.com)
+#    IMAGE_TAG             image tag to run                  (latest)
+#    PROXIMA_VERSION       version label on the containers   (0.2.0)
+# ═══════════════════════════════════════════════════════════════════
+

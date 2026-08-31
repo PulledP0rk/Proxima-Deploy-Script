@@ -1,0 +1,113 @@
+name: Compose drift check
+
+# The deploy composes in this repo are GENERATED from the composes the
+# Proxima-Backend and Proxima-Frontend repos actually run. They drifted
+# badly once before: the deploy stack was missing infisical entirely, so
+# a deployment built from it could not store a Proxmox credential at all
+# (secret_resolver has no local fallback) — it saved the server row and
+# then left the resource tree empty, with nothing in the logs that named
+# the real cause. This job exists so that cannot recur silently.
+#
+# Two ways drift appears, and both are covered:
+#   * someone hand-edits a generated file here      -> push / pull_request
+#   * a SOURCE compose changes in the other repo    -> schedule, or a
+#     repository_dispatch from that repo's release workflow:
+#
+#       curl -X POST -H "Authorization: Bearer $TOKEN" \
+#         -H "Accept: application/vnd.github+json" \
+#         https://api.github.com/repos/<owner>/Proxima-Deploy-Script/dispatches \
+#         -d '{"event_type":"source-compose-changed"}'
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily, so a source-repo change is caught within 24h even if that
+    # repo never dispatches.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [source-compose-changed]
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout deploy scripts
+        uses: actions/checkout@v4
+        with:
+          path: Proxima-Deploy-Script
+
+      # The renderer resolves the source composes as SIBLINGS of this
+      # repo, matching a local working copy, so both are checked out
+      # next to it rather than underneath it.
+      - name: Checkout Proxima-Backend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Proxima-Backend
+          token: ${{ secrets.REPO_SYNC_TOKEN }}
+          path: Proxima-Backend
+
+      - name: Checkout Proxima-Frontend
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/Proxima-Frontend
+          token: ${{ secrets.REPO_SYNC_TOKEN }}
+          path: Proxima-Frontend
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check the generated composes are current
+        working-directory: Proxima-Deploy-Script
+        run: node scripts/render-deploy-compose.mjs --check
+
+      # A file that parses is not the same as a file that is current,
+      # but a generated file that does not parse is worse — catch it
+      # here rather than in someone's Portainer stack.
+      - name: Validate the rendered composes
+        working-directory: Proxima-Deploy-Script
+        env:
+          INFISICAL_BOOTSTRAP_EMAIL: ci@example.invalid
+          INFISICAL_BOOTSTRAP_PASSWORD: ci-placeholder
+          COMPOSE_PROFILES: infisical
+        run: |
+          docker compose -f docker-compose.backend.yml config --quiet
+          docker compose -f docker-compose.frontend.yml config --quiet
+          echo "Both deploy composes parse."
+
+      # Proxima's own images are verified multi-arch by each source
+      # repo's release workflow. What this checks is the OTHER half:
+      # that no third-party pin has quietly become a single-arch image,
+      # which would only ever be discovered by an arm64 operator hitting
+      # "exec format error" at boot. An upstream can drop an arch on a
+      # major bump, so this re-checks on every run, not just on change.
+      #
+      # Both the generated deploy composes AND the source composes are
+      # audited: a pin enters through a source repo, and catching it
+      # there is the difference between a CI failure and a Pi that will
+      # not boot. See CLAUDE.md § "Cross-architecture".
+      - name: Verify third-party pins are multi-arch
+        run: |
+          fail=0
+          images=$(grep -h "^    image:" \
+                     Proxima-Deploy-Script/docker-compose.backend.yml \
+                     Proxima-Deploy-Script/docker-compose.frontend.yml \
+                     Proxima-Backend/docker-compose.yml \
+                     Proxima-Frontend/docker-compose.yml \
+                   | awk '{print $2}' | grep -v '\${' | sort -u)
+          for img in $images; do
+            echo "── $img"
+            manifest=$(docker buildx imagetools inspect "$img" 2>/dev/null || true)
+            if [ -z "$manifest" ]; then
+              echo "::error::could not inspect $img"; fail=1; continue
+            fi
+            for want in linux/amd64 linux/arm64; do
+              echo "$manifest" | grep -q "$want" \
+                || { echo "::error::$img is missing $want"; fail=1; }
+            done
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "Every third-party pin resolves on amd64 and arm64."

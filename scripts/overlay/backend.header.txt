@@ -1,0 +1,106 @@
+# ═══════════════════════════════════════════════════════════════════
+#  Proxima — Backend stack
+# ═══════════════════════════════════════════════════════════════════
+#
+#  Deploy with either:
+#
+#    COMPOSE_PROFILES=infisical docker compose -f docker-compose.backend.yml up -d
+#
+#  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
+#  Web editor) and set the variables below in the stack's
+#  "Environment variables" panel. There are no bind mounts and no
+#  files on disk to prepare — everything lives in named volumes.
+#
+#  ── The infisical profile is REQUIRED ──────────────────────────
+#    Set COMPOSE_PROFILES=infisical (Portainer: add it as a stack
+#    environment variable). Without it the infisical, valkey and
+#    bootstrap services never start, and:
+#
+#      * src/services/secret_resolver.py has NO local fallback — the
+#        Fernet-on-disk path was removed in May 2026 — so adding a
+#        Proxmox server raises SecretStoreUnavailable. The tell is a
+#        server row that saves and lists fine while the sidebar
+#        resource tree stays empty.
+#      * is_token_blacklisted() returns False, so signing out does
+#        not revoke a token; it stays valid until it expires.
+#      * check_rate_limit() returns (True, max), so the login (5/15m),
+#        TOTP (3/5m) and password-reset (3/hr) caps are all inert.
+#
+#  ── Architecture note ──────────────────────────────────────────
+#    Every credential Proxima holds is encrypted by a key that is
+#    ultimately unwrapped with INFISICAL_ENCRYPTION_KEY from this
+#    stack's environment. Running this stack and the Infisical
+#    service on the SAME host means one host compromise reaches both
+#    the wrapping key and the ciphertext. For a deployment that holds
+#    production Proxmox credentials, run Infisical on its own host
+#    and point INFISICAL_API_URL at it.
+#
+#  ── Private registry (do this FIRST) ───────────────────────────
+#    The images live in a private Harbor. The pull is done by the
+#    DOCKER DAEMON, which reads ~/.docker/config.json — it does not
+#    see this stack's environment variables. The REGISTRY_* vars
+#    below are passed INTO the containers for their own registry
+#    polling and do NOT authenticate the pull. Without a login you get:
+#
+#      pull access denied ... authorization failed: no basic auth credentials
+#
+#    So on the host that owns the Docker socket Portainer is bound to:
+#
+#      docker login updates.dev-proxima.com -u 'robot$name' -p '<token>'
+#
+#    The single quotes matter — a Harbor robot name contains a $, and
+#    unquoted the shell expands it away and logs you in as "robot".
+#
+#  ── Architecture ───────────────────────────────────────────────
+#    EVERY image in this stack — Proxima's own and every third-party
+#    pin — is a multi-arch manifest list covering linux/amd64 and
+#    linux/arm64, with no exceptions. One tag resolves correctly on
+#    both, so this file runs unmodified on a Raspberry Pi or an Ampere
+#    box and no `platform:` key is needed anywhere. CI fails the
+#    release if any Proxima image loses its arm64 leg, and the
+#    compose-drift workflow re-checks every third-party pin.
+#
+#  ── Variables ──────────────────────────────────────────────────
+#    COMPOSE_PROFILES   MUST be `infisical` (see above)
+#    BACKEND_PORT       host port for the API             (8443)
+#    AGENT_PORT         host port for the agent listener  (8444)
+#    INFISICAL_UI_PORT  host port for the Infisical UI    (8088)
+#    POSTGRES_USER      database user                     (proxima)
+#    POSTGRES_PASSWORD  database password                 (proxima)  ← CHANGE
+#    POSTGRES_DB        database name                     (proxima_db)
+#    VALKEY_PASSWORD    valkey requirepass           (proxima-valkey)  ← CHANGE
+#    INFISICAL_ENCRYPTION_KEY   32-hex; `openssl rand -hex 16`  ← CHANGE
+#    INFISICAL_AUTH_SECRET      32+ chars; `openssl rand -hex 32` ← CHANGE
+#    INFISICAL_BOOTSTRAP_EMAIL / _PASSWORD   required, no default
+#    REGISTRY_HOST      registry to pull from   (updates.dev-proxima.com)
+#    IMAGE_TAG          image tag to run                  (latest)
+#    PROXIMA_VERSION    version label on the containers   (0.2.0)
+#    REGISTRY_USERNAME / REGISTRY_PASSWORD
+#                       update-check + agent pulls — NOT the image pull
+#
+#  ── Updates are notify-only ────────────────────────────────────
+#    There is no auto-updater in this stack. The backend lists the
+#    semver tags published in Harbor and tells you when a newer one
+#    exists (src/services/update_check.py); applying it is:
+#
+#      docker compose -f docker-compose.backend.yml pull
+#      docker compose -f docker-compose.backend.yml up -d
+#
+#    The old update sidecar was removed from the product. It mounted
+#    the Docker socket — root on the host — next to the stack holding
+#    every Proxmox credential, which is a poor trade for saving one
+#    command.
+#
+#  After it comes up the API is on https://<host>:8443/api and the
+#  frontend stack points PROXIMA_BACKEND_UPSTREAM at that address.
+#
+#  ── Handing the frontend its Machine Identity ──────────────────
+#    On a split (DMZ) deployment the frontend runs on another host and
+#    needs the bundle this stack's bootstrap produced:
+#
+#      docker cp proxima-infisical-bootstrap:/var/lib/proxima/frontend-bundle ./bundle
+#      scp -r ./bundle <frontend-host>:
+#
+#    then follow the note in docker-compose.frontend.yml to load it.
+# ═══════════════════════════════════════════════════════════════════
+

@@ -80,7 +80,7 @@ Running on a normal VM or bare metal? Nothing extra to do.
 | Mode | What it deploys | Use when |
 |---|---|---|
 | **1 — Frontend only** | NGINX + web UI, proxying to a remote backend | The API already runs on another host |
-| **2 — Backend only** | API + PostgreSQL + update sidecar | Headless API node, UI served elsewhere |
+| **2 — Backend only** | API + PostgreSQL + secret store | Headless API node, UI served elsewhere |
 | **3 — Full Stack** *(recommended)* | Everything on one host | Single-box install |
 
 ---
@@ -162,17 +162,15 @@ wait a moment and check `docker logs proxima-backend`.
 
 ### Updating
 
-The `sidecar` container checks the registry hourly and pulls new images on your
-chosen release channel. To change the cadence or channel, edit `proxima/.env`:
+Updates are **notify-only**. The backend lists the semver tags published in the
+registry and tells you in the UI when a newer release exists; nothing is pulled
+or restarted on your behalf.
 
-```ini
-UPDATE_CHANNEL=stable          # stable | beta
-CHECK_INTERVAL_MINUTES=60      # 0 disables automatic checks
-```
+There is deliberately no auto-updating container. The old update sidecar mounted
+the Docker socket — which is root on the host — alongside the stack that holds
+every Proxmox credential, and that is a poor trade for saving one command.
 
-then `docker compose up -d` to apply.
-
-To update by hand:
+To update:
 
 ```bash
 cd proxima
@@ -254,8 +252,11 @@ Full Stack mode brings up:
 | `proxima-frontend` | `proxima-frontend/app` | Web UI over HTTPS, proxies `/api` to the backend |
 | `proxima-backend` | `proxima-backend/app` | API server |
 | `proxima-db` | `postgres:18-alpine` | PostgreSQL database |
-| `proxima-sidecar` | `proxima-sidecar/app` | Watches the registry and applies updates |
+| `proxima-valkey` | `valkey/valkey:8-alpine` | Token revocation + rate limiting, and Infisical's session cache |
+| `proxima-infisical` | `infisical/infisical` | Secret store — holds every Proxmox credential |
 | `proxima-jwt-key-init` | `alpine/openssl` | One-shot: generates the RS256 token-signing keypair, then exits |
+| `proxima-db-init` | `postgres:18-alpine` | One-shot: creates the `infisical` database, then exits |
+| `proxima-infisical-bootstrap` | `proxima-infisical-bootstrap/app` | One-shot: provisions the Machine Identities and PKI, then exits |
 
 `proxima-jwt-key-init` is expected to show as **Exited (0)** — it runs once at
 install and on each `up` to make sure the signing keys exist. The keys live in a

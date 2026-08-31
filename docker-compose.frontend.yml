@@ -1,155 +1,208 @@
+# ╔═════════════════════════════════════════════════════════════════╗
+# ║  GENERATED FILE — DO NOT EDIT BY HAND                           ║
+# ║                                                                 ║
+# ║  Rendered by scripts/render-deploy-compose.mjs from the compose ║
+# ║  the source repo actually runs. Hand edits are overwritten on   ║
+# ║  the next render and fail CI's drift check in the meantime.     ║
+# ║                                                                 ║
+# ║  To change this file, change the SOURCE compose, then re-run:   ║
+# ║      node scripts/render-deploy-compose.mjs                     ║
+# ║                                                                 ║
+# ║  The header comment above the services comes from              ║
+# ║  scripts/overlay/, which is also where any deployment-only     ║
+# ║  service would be spliced in from.                             ║
+# ╚═════════════════════════════════════════════════════════════════╝
+
 # ═══════════════════════════════════════════════════════════════════
-#  Proxima — Frontend stack (SPA + TLS edge + update sidecar)
+#  Proxima — Frontend stack (SPA + NGINX TLS terminator)
 # ═══════════════════════════════════════════════════════════════════
 #
 #  Deploy with either:
 #
-#    PROXIMA_BACKEND_UPSTREAM=http://10.0.0.5:8443 \
-#      docker compose -f docker-compose.frontend.yml up -d
+#    docker compose -f docker-compose.frontend.yml up -d
 #
 #  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
 #  Web editor) and set the variables below in the stack's
-#  "Environment variables" panel. No bind mounts and no files on disk
-#  are required — everything lives in named volumes.
+#  "Environment variables" panel. No bind mounts, no files on disk.
 #
-#  ── Private registry (do this FIRST) ───────────────────────────
-#    The images live in a private Harbor. The pull is done by the
-#    DOCKER DAEMON, which reads ~/.docker/config.json — it does not
-#    see this stack's environment variables. The REGISTRY_* vars
-#    below are passed INTO the sidecar container for its own registry
-#    polling and do NOT authenticate the pull. Without a login you get:
+#  Log in to the private registry on the Docker host FIRST — see the
+#  note at the top of docker-compose.backend.yml.
 #
-#      pull access denied ... authorization failed: no basic auth credentials
+#  The browser only ever talks to this stack; /api and /ws are proxied
+#  server-side, so an absolute http:// API URL is never needed and
+#  never blocked as mixed content.
 #
-#    So on the host that owns the Docker socket Portainer is bound to:
+#  ── Same host as the backend, or a different one? ──────────────
+#    CO-LOCATED (default): leave PROXIMA_BACKEND_UPSTREAM unset. NGINX
+#    proxies to https://backend-nginx:8443 over proxima-net, which the
+#    backend stack creates.
 #
-#      docker login updates.dev-proxima.com -u 'robot$name' -p '<token>'
+#    SPLIT / DMZ: set PROXIMA_BACKEND_UPSTREAM to the backend's
+#    published address (e.g. https://10.0.0.5:8443) and, on this host,
+#    create the network the compose expects to join:
 #
-#    The single quotes matter — a Harbor robot name contains a $, and
-#    unquoted the shell expands it away and logs you in as "robot".
+#      docker network create proxima-internal
+#
+#    It stays empty here — the frontend's cert fetcher reaches
+#    Infisical over INFISICAL_API_URL instead — but the stack declares
+#    it `external` and will not start without it.
+#
+#  ── Machine Identity bundle (mTLS mode) ────────────────────────
+#    The frontend presents a client certificate to backend-nginx, and
+#    fetches it with credentials the BACKEND stack's bootstrap issued.
+#    Load them into this host's volume once (see the note on the
+#    infisical-frontend-secrets mount below). Until you do, the cert
+#    fetcher has no identity and the mTLS handshake fails.
+#
+#  ── Architecture ───────────────────────────────────────────────
+#    EVERY image here is a multi-arch manifest list (amd64 + arm64),
+#    with no exceptions, so one tag resolves correctly on a Raspberry
+#    Pi or an Ampere box and no `platform:` key is needed.
+#
+#  ── Updates are notify-only ────────────────────────────────────
+#    There is no auto-updater in this stack. To apply a new release:
+#
+#      docker compose -f docker-compose.frontend.yml pull
+#      docker compose -f docker-compose.frontend.yml up -d
 #
 #  ── Variables ──────────────────────────────────────────────────
-#    PROXIMA_BACKEND_UPSTREAM   REQUIRED. Where NGINX proxies /api and
-#                               /ws, e.g. http://10.0.0.5:8443. Must be
-#                               reachable from inside this container.
-#    WEBUI_PORT                 host port for the UI          (8086)
-#    PROXIMA_PUBLIC_HOSTNAME    CN/SAN of the self-signed cert (localhost)
-#    PROXIMA_VERSION            version label                 (0.1.0)
-#    IMAGE_TAG                  image tag to run              (latest)
-#    REGISTRY_URL / REGISTRY_USERNAME / REGISTRY_PASSWORD
-#                               sidecar polling only — NOT the image pull
-#    UPDATE_CHANNEL             stable | beta                 (stable)
-#    CHECK_INTERVAL_MINUTES     sidecar poll period, 0=off    (60)
-#
-#  The UI is then on https://<host>:8086 (self-signed cert on first
-#  boot; mount your own at /etc/nginx/certs/public.{pem,key} to
-#  override). The browser only ever talks to this host — /api and /ws
-#  are proxied server-side, so an absolute http:// API URL is never
-#  needed and never blocked as mixed content.
+#    WEBUI_PORT            host port for the web UI          (8086)
+#    HTTP_REDIRECT_PORT    host port for the 80→443 redirect (80)
+#    PROXIMA_PUBLIC_HOSTNAME  hostname on the public cert    (localhost)
+#    PROXIMA_BACKEND_UPSTREAM  split deployments only, see above
+#    PROXIMA_ACME_DOMAIN / _EMAIL   Let's Encrypt, optional
+#    INFISICAL_API_URL     reachable Infisical base URL
+#    INFISICAL_FRONTEND_CERT_TEMPLATE_ID / INFISICAL_CA_ID
+#                          from the backend bootstrap's output
+#    REGISTRY_HOST         registry to pull from  (updates.dev-proxima.com)
+#    IMAGE_TAG             image tag to run                  (latest)
+#    PROXIMA_VERSION       version label on the containers   (0.2.0)
 # ═══════════════════════════════════════════════════════════════════
 
+
+# ── Proxima Frontend — Docker Compose ───────────────────────────
+#
+# Runs the frontend SPA via NGINX as a standalone container. Public
+# HTTPS terminator + reverse-proxy to backend-nginx for /api.
+#
+# Usage:
+#   cp .env.example .env              # edit as needed
+#   ./proxima-compose.ps1 up -d       # auto-detects security mode
+
+# ════════════════════════════════════════════════════════════════
+#  SECURITY MODE — must match the value set in the backend stack.
+#  Mismatched modes will break the mTLS handshake between the two
+#  nginx hops. See ../Proxima-Backend/README.md § "Security Modes".
+# ════════════════════════════════════════════════════════════════
+
+# ── (1) STANDALONE — public TLS only, no mTLS to backend (default) ─
+# x-security-env: &security-env
+#   PROXIMA_SECURITY_MODE: "standalone"
+
+# ── (2) INFISICAL — Infisical-issued client cert for mTLS to backend
+x-security-env: &security-env
+  PROXIMA_SECURITY_MODE: "infisical"
+
 services:
-  # ── Frontend SPA (NGINX) ───────────────────────────────────────
   frontend:
-    image: updates.dev-proxima.com/proxima-frontend/app:${IMAGE_TAG:-latest}
+    image: ${REGISTRY_HOST:-updates.dev-proxima.com}/proxima-frontend/app:${IMAGE_TAG:-latest}
     container_name: proxima-frontend
     restart: unless-stopped
     ports:
-      # The SPA is served over HTTPS on container port 8086. Container
-      # port 80 is a redirect-only server block (301 -> https://$$host),
-      # so mapping the host port to :80 would bounce browsers to an
-      # unpublished :443.
+      # Public HTTPS
       - "${WEBUI_PORT:-8086}:8086"
+      # Optional HTTP -> HTTPS redirect (skip when DISABLE_HTTP_REDIRECT=true)
+      - "${HTTP_REDIRECT_PORT:-80}:80"
     environment:
-      - PROXIMA_SECURITY_MODE=standalone
-      - PROXIMA_PUBLIC_HOSTNAME=${PROXIMA_PUBLIC_HOSTNAME:-localhost}
-      # Same-origin API: NGINX proxies /api + /ws to the backend.
-      - VITE_API_URL=/api
-      - PROXIMA_BACKEND_UPSTREAM=${PROXIMA_BACKEND_UPSTREAM:?set PROXIMA_BACKEND_UPSTREAM to the backend URL, e.g. http://10.0.0.5:8443}
-    # ── Backend upstream patch ─────────────────────────────────
-    # The stock image ships nginx-standalone.conf with
-    #
+      <<: *security-env
+      # Same-origin proxy: SPA calls /api on the same host:port.
+      VITE_API_URL: ${VITE_API_URL:-/api}
+      VITE_API_PORT: ${VITE_API_PORT:-8086}
+      PROXIMA_PUBLIC_HOSTNAME: ${PROXIMA_PUBLIC_HOSTNAME:-localhost}
+      PROXIMA_DISABLE_HTTP_REDIRECT: ${PROXIMA_DISABLE_HTTP_REDIRECT:-false}
+      PROXIMA_BACKEND_CA_PATH: ${PROXIMA_BACKEND_CA_PATH:-}
+      PROXIMA_ACME_DOMAIN: ${PROXIMA_ACME_DOMAIN:-}
+      PROXIMA_ACME_EMAIL: ${PROXIMA_ACME_EMAIL:-}
+      INFISICAL_API_URL: ${INFISICAL_API_URL:-http://infisical:8080}
+      INFISICAL_CERT_TEMPLATE_ID: ${INFISICAL_FRONTEND_CERT_TEMPLATE_ID:-}
+      INFISICAL_CA_ID: ${INFISICAL_CA_ID:-}
+      # Only for a split (DMZ) deployment — see the entrypoint below.
+      PROXIMA_BACKEND_UPSTREAM: ${PROXIMA_BACKEND_UPSTREAM:-}
+    # ── Split-host backend upstream (optional) ─────────────────
+    # Both nginx templates hardcode
     #     set $$proxima_backend_upstream "https://backend-nginx:8443";
+    # which is correct when this stack shares a host with the backend
+    # stack (backend-nginx resolves over proxima-net). On a DMZ split
+    # the frontend runs on another machine and must be pointed at the
+    # backend's published address instead.
     #
-    # hardcoded — that is the mTLS terminator used by the full Proxima
-    # compose, which does not exist in this topology, and the backend
-    # image speaks plain HTTP on 8443. Left alone, every /api and /ws
-    # request fails first on DNS and then on the TLS handshake.
+    # Leave PROXIMA_BACKEND_UPSTREAM unset for the co-located case and
+    # every line below is a no-op. Matching is by literal substring
+    # (awk index) — the value contains '/' and '.' and must never be
+    # treated as a pattern. `$$` escapes compose interpolation; a bare
+    # `$` here is substituted away before the shell ever sees it.
     #
-    # The installer fixes this with a bind-mounted hook script, which a
-    # Portainer stack cannot do (there are no files on the host), so the
-    # rewrite is inlined here instead: patch the config TEMPLATE, then
-    # hand off to the image's real entrypoint, which copies the template
-    # into place and starts NGINX. Matching is by literal substring
-    # (awk index) — the upstream value contains '/' and '.' and must
-    # never be treated as a pattern.
+    # NB: the final exec duplicates the image's own ENTRYPOINT/CMD. If
+    # the Dockerfile's entrypoint path ever changes, change it here too.
     entrypoint:
       - /bin/sh
       - -ec
       - |
-        TPL=/etc/nginx/templates/nginx-standalone.conf
-        if [ -n "$${PROXIMA_BACKEND_UPSTREAM:-}" ] && [ -f "$$TPL" ]; then
-          awk -v up="$$PROXIMA_BACKEND_UPSTREAM" '
-              index($$0, "set $$proxima_backend_upstream") {
-                  print "    set $$proxima_backend_upstream \"" up "\";"
-                  next
-              }
-              { print }
-          ' "$$TPL" > "$$TPL.new" && mv "$$TPL.new" "$$TPL"
-          echo "[proxima] backend upstream -> $$PROXIMA_BACKEND_UPSTREAM"
+        if [ -n "$${PROXIMA_BACKEND_UPSTREAM:-}" ]; then
+          for TPL in /etc/nginx/templates/nginx-mtls.conf /etc/nginx/templates/nginx-standalone.conf; do
+            [ -f "$$TPL" ] || continue
+            awk -v up="$$PROXIMA_BACKEND_UPSTREAM" '
+                index($$0, "set $$proxima_backend_upstream") {
+                    print "    set $$proxima_backend_upstream \"" up "\";"
+                    next
+                }
+                { print }
+            ' "$$TPL" > "$$TPL.new" && mv "$$TPL.new" "$$TPL"
+            echo "[proxima] backend upstream -> $$PROXIMA_BACKEND_UPSTREAM ($$TPL)"
+          done
         fi
         exec /sbin/tini -- /proxima-entrypoint.sh nginx -g "daemon off;"
     volumes:
-      # Themes and branding uploaded through the web UI. On a split
-      # deployment these are local to the frontend host; the built-in
-      # themes are re-seeded from the image on every boot.
       - themes-data:/usr/share/nginx/html/themes
       - branding-data:/usr/share/nginx/html/branding
-      # Uncomment to keep the self-signed cert across container
-      # re-creation, or to mount your own public.pem / public.key.
-      # - frontend-certs:/etc/nginx/certs
+      - frontend-public-cert:/etc/nginx/certs
+      - frontend-cert-state:/var/lib/proxima/cert-state
+      # Machine Identity credentials for this (DMZ-separated) host.
+      # A named volume rather than a host bind so this stack stays
+      # file-free and can be pasted into a Portainer web-editor stack.
+      #
+      # Load it from the bundle the backend stack's infisical-bootstrap
+      # produced, once, on this host:
+      #   docker cp proxima-infisical-bootstrap:/var/lib/proxima/frontend-bundle ./bundle   # on the BACKEND host
+      #   scp -r ./bundle <frontend-host>:                                                  # move it across the DMZ
+      #   docker run --rm -v proxima-frontend_infisical-frontend-secrets:/dst \
+      #     -v "$PWD/bundle":/src:ro alpine:3.20 sh -c 'cp /src/* /dst/'                     # on the FRONTEND host
+      - infisical-frontend-secrets:/etc/proxima/infisical-secrets:ro
     labels:
       - "proxima.managed=true"
       - "proxima.component=frontend"
-      - "proxima.version=${PROXIMA_VERSION:-0.1.0}"
+      - "proxima.version=${PROXIMA_VERSION:-0.2.0}"
     networks:
       - proxima-net
-
-  # ── Update sidecar ─────────────────────────────────────────────
-  # Polls the registry and applies new images. Set
-  # CHECK_INTERVAL_MINUTES=0 to disable the poll, or delete this
-  # service entirely if you manage updates yourself.
-  #
-  # NOTE: this image is still published amd64-only. On an arm64 host
-  # (Raspberry Pi, Ampere) it will crash-loop with "exec format error"
-  # even once the backend and frontend images are multi-arch -- delete
-  # this service there until its build is converted too.
-  sidecar:
-    image: updates.dev-proxima.com/proxima-sidecar/app:${IMAGE_TAG:-latest}
-    container_name: proxima-sidecar
-    restart: unless-stopped
-    environment:
-      - REGISTRY_URL=${REGISTRY_URL:-}
-      - REGISTRY_USERNAME=${REGISTRY_USERNAME:-}
-      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-}
-      - FRONTEND_IMAGE=${FRONTEND_IMAGE:-proxima-frontend/app}
-      - BACKEND_IMAGE=${BACKEND_IMAGE:-proxima-backend/app}
-      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
-      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
-      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
-    volumes:
-      # Required: the sidecar pulls and re-creates containers through
-      # the Docker API. Drop this service if that is not acceptable.
-      - /var/run/docker.sock:/var/run/docker.sock
-      - sidecar-state:/data
-    networks:
-      - proxima-net
+      # In `infisical` mode the frontend's cert fetcher needs to reach
+      # the `infisical` service on proxima-internal. The network is
+      # created by the backend stack and attached here as external.
+      - proxima-internal
 
 networks:
   proxima-net:
+    name: proxima-net
+  proxima-internal:
+    name: proxima-internal
+    # Created by Proxima-Backend/docker-compose.yml; declared external
+    # here so this stack can attach to it without re-creating it.
+    external: true
 
 volumes:
-  sidecar-state:
+  # Machine Identity bundle for this host's cert fetcher, copied in
+  # from the backend stack's infisical-bootstrap output (see above).
+  infisical-frontend-secrets:
   themes-data:
   branding-data:
-  # frontend-certs:
+  frontend-public-cert:
+  frontend-cert-state:

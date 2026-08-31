@@ -1,21 +1,60 @@
+# ╔═════════════════════════════════════════════════════════════════╗
+# ║  GENERATED FILE — DO NOT EDIT BY HAND                           ║
+# ║                                                                 ║
+# ║  Rendered by scripts/render-deploy-compose.mjs from the compose ║
+# ║  the source repo actually runs. Hand edits are overwritten on   ║
+# ║  the next render and fail CI's drift check in the meantime.     ║
+# ║                                                                 ║
+# ║  To change this file, change the SOURCE compose, then re-run:   ║
+# ║      node scripts/render-deploy-compose.mjs                     ║
+# ║                                                                 ║
+# ║  The header comment above the services comes from              ║
+# ║  scripts/overlay/, which is also where any deployment-only     ║
+# ║  service would be spliced in from.                             ║
+# ╚═════════════════════════════════════════════════════════════════╝
+
 # ═══════════════════════════════════════════════════════════════════
-#  Proxima — Backend stack (API + PostgreSQL + update sidecar)
+#  Proxima — Backend stack
 # ═══════════════════════════════════════════════════════════════════
 #
 #  Deploy with either:
 #
-#    docker compose -f docker-compose.backend.yml up -d
+#    COMPOSE_PROFILES=infisical docker compose -f docker-compose.backend.yml up -d
 #
 #  …or paste this file into a Portainer stack (Stacks ▸ Add stack ▸
 #  Web editor) and set the variables below in the stack's
-#  "Environment variables" panel. No bind mounts and no files on disk
-#  are required — everything lives in named volumes.
+#  "Environment variables" panel. There are no bind mounts and no
+#  files on disk to prepare — everything lives in named volumes.
+#
+#  ── The infisical profile is REQUIRED ──────────────────────────
+#    Set COMPOSE_PROFILES=infisical (Portainer: add it as a stack
+#    environment variable). Without it the infisical, valkey and
+#    bootstrap services never start, and:
+#
+#      * src/services/secret_resolver.py has NO local fallback — the
+#        Fernet-on-disk path was removed in May 2026 — so adding a
+#        Proxmox server raises SecretStoreUnavailable. The tell is a
+#        server row that saves and lists fine while the sidebar
+#        resource tree stays empty.
+#      * is_token_blacklisted() returns False, so signing out does
+#        not revoke a token; it stays valid until it expires.
+#      * check_rate_limit() returns (True, max), so the login (5/15m),
+#        TOTP (3/5m) and password-reset (3/hr) caps are all inert.
+#
+#  ── Architecture note ──────────────────────────────────────────
+#    Every credential Proxima holds is encrypted by a key that is
+#    ultimately unwrapped with INFISICAL_ENCRYPTION_KEY from this
+#    stack's environment. Running this stack and the Infisical
+#    service on the SAME host means one host compromise reaches both
+#    the wrapping key and the ciphertext. For a deployment that holds
+#    production Proxmox credentials, run Infisical on its own host
+#    and point INFISICAL_API_URL at it.
 #
 #  ── Private registry (do this FIRST) ───────────────────────────
 #    The images live in a private Harbor. The pull is done by the
 #    DOCKER DAEMON, which reads ~/.docker/config.json — it does not
 #    see this stack's environment variables. The REGISTRY_* vars
-#    below are passed INTO the sidecar container for its own registry
+#    below are passed INTO the containers for their own registry
 #    polling and do NOT authenticate the pull. Without a login you get:
 #
 #      pull access denied ... authorization failed: no basic auth credentials
@@ -27,24 +66,105 @@
 #    The single quotes matter — a Harbor robot name contains a $, and
 #    unquoted the shell expands it away and logs you in as "robot".
 #
-#  ── Variables ──────────────────────────────────────────────────
-#    BACKEND_PORT        host port for the API            (8443)
-#    POSTGRES_USER       database user                    (proxima)
-#    POSTGRES_PASSWORD   database password                (proxima)  ← CHANGE
-#    POSTGRES_DB         database name                    (proxima_db)
-#    PROXIMA_VERSION     version label on the containers  (0.1.0)
-#    IMAGE_TAG           image tag to run                 (latest)
-#    REGISTRY_URL / REGISTRY_USERNAME / REGISTRY_PASSWORD
-#                        sidecar polling only — NOT the image pull
-#    UPDATE_CHANNEL      stable | beta                    (stable)
-#    CHECK_INTERVAL_MINUTES  sidecar poll period, 0=off   (60)
+#  ── Architecture ───────────────────────────────────────────────
+#    EVERY image in this stack — Proxima's own and every third-party
+#    pin — is a multi-arch manifest list covering linux/amd64 and
+#    linux/arm64, with no exceptions. One tag resolves correctly on
+#    both, so this file runs unmodified on a Raspberry Pi or an Ampere
+#    box and no `platform:` key is needed anywhere. CI fails the
+#    release if any Proxima image loses its arm64 leg, and the
+#    compose-drift workflow re-checks every third-party pin.
 #
-#  After it comes up the API is on http://<host>:8443/api and the
+#  ── Variables ──────────────────────────────────────────────────
+#    COMPOSE_PROFILES   MUST be `infisical` (see above)
+#    BACKEND_PORT       host port for the API             (8443)
+#    AGENT_PORT         host port for the agent listener  (8444)
+#    INFISICAL_UI_PORT  host port for the Infisical UI    (8088)
+#    POSTGRES_USER      database user                     (proxima)
+#    POSTGRES_PASSWORD  database password                 (proxima)  ← CHANGE
+#    POSTGRES_DB        database name                     (proxima_db)
+#    VALKEY_PASSWORD    valkey requirepass           (proxima-valkey)  ← CHANGE
+#    INFISICAL_ENCRYPTION_KEY   32-hex; `openssl rand -hex 16`  ← CHANGE
+#    INFISICAL_AUTH_SECRET      32+ chars; `openssl rand -hex 32` ← CHANGE
+#    INFISICAL_BOOTSTRAP_EMAIL / _PASSWORD   required, no default
+#    REGISTRY_HOST      registry to pull from   (updates.dev-proxima.com)
+#    IMAGE_TAG          image tag to run                  (latest)
+#    PROXIMA_VERSION    version label on the containers   (0.2.0)
+#    REGISTRY_USERNAME / REGISTRY_PASSWORD
+#                       update-check + agent pulls — NOT the image pull
+#
+#  ── Updates are notify-only ────────────────────────────────────
+#    There is no auto-updater in this stack. The backend lists the
+#    semver tags published in Harbor and tells you when a newer one
+#    exists (src/services/update_check.py); applying it is:
+#
+#      docker compose -f docker-compose.backend.yml pull
+#      docker compose -f docker-compose.backend.yml up -d
+#
+#    The old update sidecar was removed from the product. It mounted
+#    the Docker socket — root on the host — next to the stack holding
+#    every Proxmox credential, which is a poor trade for saving one
+#    command.
+#
+#  After it comes up the API is on https://<host>:8443/api and the
 #  frontend stack points PROXIMA_BACKEND_UPSTREAM at that address.
+#
+#  ── Handing the frontend its Machine Identity ──────────────────
+#    On a split (DMZ) deployment the frontend runs on another host and
+#    needs the bundle this stack's bootstrap produced:
+#
+#      docker cp proxima-infisical-bootstrap:/var/lib/proxima/frontend-bundle ./bundle
+#      scp -r ./bundle <frontend-host>:
+#
+#    then follow the note in docker-compose.frontend.yml to load it.
 # ═══════════════════════════════════════════════════════════════════
 
+
+# ── Proxima Backend — Docker Compose ────────────────────────────
+#
+# Runs the backend API server, PostgreSQL, and (optionally) a
+# self-hosted Infisical + Valkey pair behind the DMZ.
+#
+# Usage:
+#   cp .env.example .env              # edit as needed
+#   ./proxima-compose.ps1 up -d       # auto-detects security mode
+#
+# On first boot the entrypoint auto-generates secrets.json from the
+# DB_* env vars — no manual setup required.
+
+# ════════════════════════════════════════════════════════════════
+#  SECURITY MODE — uncomment EXACTLY ONE of the two blocks below.
+#
+#  The wrapper scripts (proxima-compose.ps1 / proxima-compose.sh)
+#  read the active anchor and set COMPOSE_PROFILES automatically.
+#  Manual operators should run with:
+#       PowerShell:  $env:COMPOSE_PROFILES = "infisical"
+#       bash:        export COMPOSE_PROFILES=infisical
+#  (no profile is needed for `standalone`.)
+#
+#  See README.md § "Security Modes" for the full reference.
+# ════════════════════════════════════════════════════════════════
+
+# ── Security mode env (shared by all app services) ────────────
+# Only `infisical` is supported. Setting any other value will cause
+# the backend to refuse to start. The legacy `standalone` mode
+# (Fernet on disk) was removed because a host breach would expose
+# every Proxmox server credential at once.
+#
+# The matching compose profile must be active so the
+# infisical/valkey/bootstrap services start:
+#   pwsh:  $env:COMPOSE_PROFILES = 'infisical'
+#   bash:  export COMPOSE_PROFILES=infisical
+# (the proxima-compose.ps1 wrapper does this automatically.)
+x-security-env: &security-env
+  PROXIMA_SECURITY_MODE: ${PROXIMA_SECURITY_MODE:-infisical}
+
 services:
-  # ── PostgreSQL database ────────────────────────────────────────
+  # ── PostgreSQL (shared between Proxima app + Infisical) ─────
+  # Lives on proxima-internal only -- not reachable from outside
+  # the DMZ. Ships two databases:
+  #   * proxima_db    -- the main app schema (managed by alembic)
+  #   * infisical     -- Infisical's own schema (managed by Infisical)
   db:
     image: postgres:18-alpine
     container_name: proxima-db
@@ -63,119 +183,443 @@ services:
     networks:
       - proxima-internal
 
-  # ── JWT signing keys (one-shot init) ───────────────────────────
-  # The backend signs access tokens with RS256 and reads the key pair
-  # from /app/keys (settings.jwt_private_key_path defaults to
-  # ./keys/jwt_private.pem, workdir /app). The published image ships no
-  # keys — they are per-deployment secrets — and nothing generates them
-  # at startup, so without this service login authenticates the user and
-  # then dies with HTTP 500 (FileNotFoundError: './keys/jwt_private.pem')
-  # while issuing the token.
+  # ── Infisical database bootstrap (one-shot) ─────────────────
+  # Creates the `infisical` database alongside POSTGRES_DB.
   #
-  # The keys live in a named volume so sessions survive a restart;
-  # deleting the volume rotates them and invalidates every issued token.
-  jwt-key-init:
-    image: alpine/openssl:latest
-    container_name: proxima-jwt-key-init
+  # This used to be a script bind-mounted into
+  # /docker-entrypoint-initdb.d, which had two problems. A Portainer
+  # web-editor stack has no files on the host to bind -- and, worse,
+  # postgres only runs that directory when the data dir is EMPTY, so
+  # any deployment whose db volume predates Infisical would never get
+  # the database and `infisical` would crash-loop on connect forever.
+  #
+  # Running it as an ordinary one-shot against an already-healthy
+  # server fixes both. The SELECT ... \gexec guard keeps it idempotent,
+  # so it is a no-op on every boot after the first.
+  db-init:
+    image: postgres:18-alpine
+    container_name: proxima-db-init
     restart: "no"
+    profiles: ["infisical"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-proxima}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        if [ ! -s /keys/jwt_private.pem ] || [ ! -s /keys/jwt_public.pem ]; then
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /keys/jwt_private.pem && \
-          openssl pkey -in /keys/jwt_private.pem -pubout -out /keys/jwt_public.pem && \
-          chmod 600 /keys/jwt_private.pem && \
-          chmod 644 /keys/jwt_public.pem && \
-          echo "[jwt-key-init] generated RS256 signing keypair"
-        else
-          echo "[jwt-key-init] JWT keys already present"
-        fi
-    volumes:
-      - jwt-keys:/keys
+        psql -v ON_ERROR_STOP=1 -h db -U "${POSTGRES_USER:-proxima}" -d "${POSTGRES_DB:-proxima_db}" <<'SQL'
+        SELECT 'CREATE DATABASE infisical'
+        WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'infisical')\gexec
+        SQL
+        echo "[db-init] ensured database 'infisical' exists"
     networks:
       - proxima-internal
 
-  # ── Backend API server ─────────────────────────────────────────
+  # ── Valkey (Redis-compatible cache for Infisical sessions) ──
+  # Activated in `infisical` mode only.
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: proxima-valkey
+    restart: unless-stopped
+    profiles: ["infisical"]
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${VALKEY_PASSWORD:-proxima-valkey}
+    volumes:
+      - valkey-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a ${VALKEY_PASSWORD:-proxima-valkey} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - proxima-internal
+
+  # ── Infisical (self-hosted secrets manager + PKI) ───────────
+  # Activated in `infisical` mode only. Holds:
+  #   * application secrets (KV)
+  #   * an internal CA + certificate templates for mTLS between
+  #     frontend-nginx and backend-nginx
+  # Bootstrap is fully automated by the `infisical-bootstrap`
+  # one-shot service; no manual UI clicks required.
+  infisical:
+    image: infisical/infisical:v0.159.25
+    container_name: proxima-infisical
+    restart: unless-stopped
+    profiles: ["infisical"]
+    depends_on:
+      db:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+      valkey:
+        condition: service_healthy
+    # Web UI exposed on the host so operators can log in to inspect
+    # secrets / browse the PKI. Default credentials are
+    # admin@proxima.local / Proxima (synced with the Proxima admin).
+    ports:
+      - "${INFISICAL_UI_PORT:-8088}:8080"
+    environment:
+      # Encryption / signing -- generate per-deployment, store in .env.
+      # 32-byte hex strings: openssl rand -hex 16
+      ENCRYPTION_KEY: ${INFISICAL_ENCRYPTION_KEY:-6c1fe4e6f7b9a3d2c5e8a1b4d7f0c3e6}
+      AUTH_SECRET: ${INFISICAL_AUTH_SECRET:-change-me-32-chars-min-please-now}
+      DB_CONNECTION_URI: postgres://${POSTGRES_USER:-proxima}:${POSTGRES_PASSWORD:-proxima}@db:5432/infisical
+      REDIS_URL: redis://default:${VALKEY_PASSWORD:-proxima-valkey}@valkey:6379
+      SITE_URL: ${INFISICAL_SITE_URL:-http://infisical:8080}
+      TELEMETRY_ENABLED: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/api/status >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      # proxima-net is required for the host port mapping to work
+      # (Docker refuses to publish ports for containers attached only
+      # to networks with `internal: true`). proxima-internal carries
+      # the actual app traffic from backend-nginx + frontend.
+      - proxima-net
+      - proxima-internal
+
+  # ── Infisical Bootstrap (one-shot provisioner) ─────────────
+  # Runs scripts/infisical/bootstrap.sh against the local infisical
+  # instance. Idempotent: on re-runs it detects existing resources by
+  # name and reuses them (no-op). Exits 0 on success and is gated by
+  # `service_completed_successfully` so backend-nginx waits for it.
+  #
+  # Outputs:
+  #   * named volume `infisical-backend-secrets` -> consumed by
+  #     backend-nginx as /etc/proxima/infisical-secrets (read-only)
+  #   * host bind   `./scripts/infisical/output/frontend-bundle/`
+  #     -> operator copies this directory's contents to the (DMZ-
+  #     separated) frontend host as Proxima-Frontend/infisical-secrets/
+  infisical-bootstrap:
+    image: ${REGISTRY_HOST:-updates.dev-proxima.com}/proxima-infisical-bootstrap/app:${IMAGE_TAG:-latest}
+    container_name: proxima-infisical-bootstrap
+    profiles: ["infisical"]
+    restart: "no"
+    depends_on:
+      infisical:
+        condition: service_healthy
+    environment:
+      INFISICAL_API_URL: ${INFISICAL_API_URL:-http://infisical:8080}
+      # Public URL embedded in the frontend bundle so the (DMZ-
+      # separated) frontend host can reach Infisical. Defaults to the
+      # internal API URL for same-host setups; override for split deploys.
+      INFISICAL_PUBLIC_URL: ${INFISICAL_PUBLIC_URL:-${INFISICAL_API_URL:-http://infisical:8080}}
+      INFISICAL_BOOTSTRAP_EMAIL: ${INFISICAL_BOOTSTRAP_EMAIL:?must be set in .env}
+      INFISICAL_BOOTSTRAP_PASSWORD: ${INFISICAL_BOOTSTRAP_PASSWORD:?must be set in .env}
+      INFISICAL_ORG_NAME: ${INFISICAL_ORG_NAME:-Proxima}
+      INFISICAL_PROJECT_NAME: ${INFISICAL_PROJECT_NAME:-proxima-pki}
+    volumes:
+      - infisical-backend-secrets:/var/lib/proxima/backend-secrets
+      - infisical-bootstrap-state:/var/lib/proxima/bootstrap-state
+      # Named volume rather than a host bind so this stack stays
+      # file-free (a Portainer web-editor stack cannot bind a path).
+      # Copy the bundle out to the frontend host with:
+      #   docker cp proxima-infisical-bootstrap:/var/lib/proxima/frontend-bundle ./
+      - infisical-frontend-bundle:/var/lib/proxima/frontend-bundle
+    networks:
+      - proxima-internal
+
+  # ── Backend API Server ──────────────────────────────────────
   backend:
-    image: updates.dev-proxima.com/proxima-backend/app:${IMAGE_TAG:-latest}
+    image: ${REGISTRY_HOST:-updates.dev-proxima.com}/proxima-backend/app:${IMAGE_TAG:-latest}
     container_name: proxima-backend
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
-      jwt-key-init:
+      # Valkey connection is a one-shot at startup with no reconnect, so wait
+      # for it to be healthy first (required:false → skipped if profile off).
+      valkey:
+        condition: service_healthy
+        required: false
+      # In `infisical` mode wait for Infisical and the one-shot
+      # bootstrap to finish before booting -- the backend reads the
+      # Machine Identity bundle and the `proxima-config` workspace
+      # pointers at startup. The dependency is silently skipped in
+      # `standalone` mode (infisical profile inactive).
+      infisical:
+        condition: service_healthy
+        required: false
+      infisical-bootstrap:
         condition: service_completed_successfully
-    ports:
-      # Plain HTTP on 8443. Put it behind the Proxima frontend (which
-      # terminates TLS and proxies /api + /ws) or your own reverse proxy;
-      # do not expose this port to the internet directly.
-      - "${BACKEND_PORT:-8443}:8443"
+        required: false
+      # Provisioner keypair for RDP gateway tokens is generated once by this
+      # one-shot into a shared volume before the backend reads it.
+      rdp-key-init:
+        condition: service_completed_successfully
+    expose:
+      - "8443"
     environment:
-      - PD_FRONTEND_ORIGINS=${PD_FRONTEND_ORIGINS:-*}
-      - DB_HOST=db
-      - DB_PORT=5432
-      - DB_USER=${POSTGRES_USER:-proxima}
-      - DB_PASS=${POSTGRES_PASSWORD:-proxima}
-      - DB_NAME=${POSTGRES_DB:-proxima_db}
-      - SIDECAR_URL=http://sidecar:9009
-      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
-      # Themes and branding uploaded through the web UI are written here
-      # and served by the frontend from its own copy of these volumes.
-      - FRONTEND_DIST_PATH=/shared-assets
+      <<: *security-env
+      PD_FRONTEND_ORIGINS: "*"
+      # RDP console: sign gateway "jet" tokens with the shared provisioner key.
+      PROXIMA_RDP_PROVISIONER_KEY_PATH: /etc/proxima/rdp/rdp_provisioner.key
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER:-proxima}
+      DB_PASS: ${POSTGRES_PASSWORD:-proxima}
+      DB_NAME: ${POSTGRES_DB:-proxima_db}
+      # Valkey (token-revocation blacklist + rate limiting). Must point at the
+      # valkey service and include its requirepass auth, else the backend
+      # connects to localhost:6379 with no password and fails open (revocation
+      # and rate limiting silently disabled).
+      VALKEY_URL: valkey://default:${VALKEY_PASSWORD:-proxima-valkey}@valkey:6379/0
+      # NOTE: PROXIMA_VERSION is intentionally NOT set here — the running
+      # version is baked into the image at build time (Dockerfile ARG) so the
+      # container self-reports its real released version.
+      # Notify-only update check against Harbor (no in-app updater).
+      REGISTRY_HOST: ${REGISTRY_HOST:-updates.dev-proxima.com}
+      REGISTRY_BACKEND_REPO: ${REGISTRY_BACKEND_REPO:-proxima-backend/app}
+      REGISTRY_FRONTEND_REPO: ${REGISTRY_FRONTEND_REPO:-proxima-frontend/app}
+      REGISTRY_USERNAME: ${REGISTRY_USERNAME:-}
+      REGISTRY_PASSWORD: ${REGISTRY_PASSWORD:-}
+      # In-LXC Docker agent auto-update: the backend polls this Harbor repo for
+      # the highest semver tag, pulls the OCI artifact's binaries into the dist
+      # dir, and rolls the new binary out to every enrolled Docker LXC.
+      REGISTRY_AGENT_REPO: ${REGISTRY_AGENT_REPO:-proxima-docker-module/agent}
+      # Network-flow agent auto-update, same mechanism, its own Harbor repo.
+      # NOTE: Harbor robot accounts are project-scoped — the robot in
+      # REGISTRY_USERNAME needs *pull* on this project too, or the poll returns
+      # 401 and the agent is never staged.
+      REGISTRY_FLOW_AGENT_REPO: ${REGISTRY_FLOW_AGENT_REPO:-proxima-flow-agent/agent}
+      AGENT_UPDATE_POLL_INTERVAL: ${AGENT_UPDATE_POLL_INTERVAL:-300}
+      # In-LXC Docker agent enrollment. The URL the agent (inside the Docker LXC)
+      # dials back to — must be reachable FROM the LXC. When empty, enrollment is
+      # skipped at install time and Proxima drives Docker over SSH/pct-exec.
+      # Bootstrap default only: the live value is the `agent_backend_url` app
+      # setting (Settings ▸ General), which is stored in the database, survives a
+      # rebuild, overrides this, and applies without a restart.
+      PROXIMA_AGENT_BACKEND_URL: ${PROXIMA_AGENT_BACKEND_URL:-}
+      PROXIMA_AGENT_DIST: ${PROXIMA_AGENT_DIST:-/app/agent_dist}
+      # ── Traffic Analysis GeoIP ────────────────────────────
+      # The backend downloads the DB-IP Lite databases itself (validated, then
+      # hot-reloaded — no restart, no scripts). They land on the /app/data
+      # volume so a rebuild does not re-download. Point the DB paths at your
+      # own MaxMind files to opt that slot out of management entirely, or set
+      # PROXIMA_GEOIP_AUTO_UPDATE=0 for air-gapped installs.
+      PROXIMA_GEOIP_DB: ${PROXIMA_GEOIP_DB:-/app/data/geoip/dbip-country-lite.mmdb}
+      PROXIMA_GEOIP_ASN_DB: ${PROXIMA_GEOIP_ASN_DB:-/app/data/geoip/dbip-asn-lite.mmdb}
+      PROXIMA_GEOIP_AUTO_UPDATE: ${PROXIMA_GEOIP_AUTO_UPDATE:-1}
+      # Conversations recorded per node, per minute, per plane. Raise if the UI
+      # reports material truncation — a busy node simply has more distinct
+      # peers than the default keeps.
+      PROXIMA_FLOW_TOP_N: ${PROXIMA_FLOW_TOP_N:-256}
+      # Hostname the backend-nginx cert is issued for (its SAN). The agent dials
+      # this name (mapped to the reachable host via the LXC /etc/hosts) so strict
+      # TLS verification matches. Only change if you customized the cert CN.
+      PROXIMA_AGENT_TLS_SERVERNAME: ${PROXIMA_AGENT_TLS_SERVERNAME:-backend-nginx.proxima.internal}
+      # Bug reports are forwarded to the hosted relay (plug-and-play; no local
+      # SMTP). The install auto-enrolls at BUG_ENROLL_URL for a unique token on
+      # first report; BUG_INTAKE_TOKEN is an optional manual override.
+      BUG_INTAKE_URL: ${BUG_INTAKE_URL:-https://bugs.dev-proxima.com/intake}
+      BUG_ENROLL_URL: ${BUG_ENROLL_URL:-https://bugs.dev-proxima.com/enroll}
+      BUG_INTAKE_TOKEN: ${BUG_INTAKE_TOKEN:-}
+      FRONTEND_DIST_PATH: /shared-assets
+      # Infisical wiring -- only used when PROXIMA_SECURITY_MODE=infisical.
+      # The backend reads its app-secrets KV via the same Machine Identity
+      # bundle the cert-fetcher uses (mounted from infisical-backend-secrets).
+      INFISICAL_API_URL: ${INFISICAL_API_URL:-http://infisical:8080}
+      INFISICAL_SECRETS_DIR: /etc/proxima/infisical-secrets
     volumes:
-      - backend-secrets:/app/data
-      - jwt-keys:/app/keys
       - themes-data:/shared-assets/themes
       - branding-data:/shared-assets/branding
+      - proxima-socket:/run/proxima
+      # Persist /app/data so secrets.json (JWT signing keys, app
+      # `secret_key`) survives container recreation. Sensitive
+              # at-rest values like Proxmox API tokens live in Infisical,
+              # not on disk -- but the local JWT keypair must persist or
+              # every existing user session becomes invalid on rebuild.
+      - backend-app-data:/app/data
+      # RW so the backend can rewrite admin_password in lockstep with
+      # the Proxima webui admin's password (services/infisical_admin.py).
+      - infisical-backend-secrets:/etc/proxima/infisical-secrets
+      # RDP provisioner private key (shared with the gateway one-shot).
+      - rdp-provisioner:/etc/proxima/rdp:ro
+    command: ["/docker-supervisor.sh", "--uds", "/run/proxima/app.sock"]
     labels:
       - "proxima.managed=true"
       - "proxima.component=backend"
-      - "proxima.version=${PROXIMA_VERSION:-0.1.0}"
+      - "proxima.version=${PROXIMA_VERSION:-0.2.0}"
     networks:
       - proxima-net
       - proxima-internal
 
-  # ── Update sidecar ─────────────────────────────────────────────
-  # Polls the registry and applies new images. Set
-  # CHECK_INTERVAL_MINUTES=0 to disable the poll, or delete this
-  # service entirely if you manage updates yourself.
-  #
-  # NOTE: this image is still published amd64-only. On an arm64 host
-  # (Raspberry Pi, Ampere) it will crash-loop with "exec format error"
-  # even once the backend and frontend images are multi-arch -- delete
-  # this service there until its build is converted too.
-  sidecar:
-    image: updates.dev-proxima.com/proxima-sidecar/app:${IMAGE_TAG:-latest}
-    container_name: proxima-sidecar
+  # ── Backend NGINX (TLS terminator + mTLS in `infisical` mode) ──
+  backend-nginx:
+    image: ${REGISTRY_HOST:-updates.dev-proxima.com}/proxima-backend-nginx/app:${IMAGE_TAG:-latest}
+    container_name: proxima-backend-nginx
     restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      # In `infisical` mode wait for the bootstrap one-shot to finish
+      # populating the secrets volume. In `standalone` mode the
+      # `infisical` profile isn't active so this dependency is
+      # silently skipped by compose.
+      infisical-bootstrap:
+        condition: service_completed_successfully
+        required: false
+    ports:
+      - "${BACKEND_PORT:-8443}:8443"
+      # Agent-only TLS listener (no mTLS) — the in-LXC Docker agent authenticates
+      # by enrollment token, not a client cert, so it uses this separate port.
+      - "${AGENT_PORT:-8444}:8444"
     environment:
-      - REGISTRY_URL=${REGISTRY_URL:-}
-      - REGISTRY_USERNAME=${REGISTRY_USERNAME:-}
-      - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-}
-      - FRONTEND_IMAGE=${FRONTEND_IMAGE:-proxima-frontend/app}
-      - BACKEND_IMAGE=${BACKEND_IMAGE:-proxima-backend/app}
-      - UPDATE_CHANNEL=${UPDATE_CHANNEL:-stable}
-      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-60}
-      - PROXIMA_VERSION=${PROXIMA_VERSION:-0.1.0}
+      <<: *security-env
+      PROXIMA_BACKEND_HOSTNAME: ${PROXIMA_BACKEND_HOSTNAME:-backend-nginx.proxima.internal}
+      INFISICAL_API_URL: ${INFISICAL_API_URL:-http://infisical:8080}
+      # Cert template id and CA id are read from files in the secrets
+      # volume written by infisical-bootstrap; no env wiring needed.
     volumes:
-      # Required: the sidecar pulls and re-creates containers through
-      # the Docker API. Drop this service if that is not acceptable.
-      - /var/run/docker.sock:/var/run/docker.sock
-      - sidecar-state:/data
+      - proxima-socket:/run/proxima:ro
+      - backend-nginx-certs:/etc/nginx/certs
+      - backend-nginx-cert-state:/var/lib/proxima/cert-state
+      # Machine Identity bundle (client_id, client_secret, ca_id,
+      # cert_template_id) populated by the infisical-bootstrap
+      # one-shot. Empty in `standalone` mode (the entrypoint does
+      # not touch this volume).
+      - infisical-backend-secrets:/etc/proxima/infisical-secrets:ro
+    labels:
+      - "proxima.managed=true"
+      - "proxima.component=backend-nginx"
+      - "proxima.version=${PROXIMA_VERSION:-0.2.0}"
+    healthcheck:
+      test: ["CMD-SHELL", "pidof nginx >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - proxima-net
+      - proxima-internal
+
+  # ── RDP provisioner key init (one-shot) ─────────────────────
+  # Generates the RSA keypair Proxima signs Devolutions Gateway "jet" tokens
+  # with. Idempotent: only generates if the shared volume is empty. The backend
+  # reads the private key; the gateway trusts the matching public key. openssl
+  # is already in the image, so no network/egress is needed.
+  rdp-key-init:
+    image: alpine/openssl:latest
+    container_name: proxima-rdp-key-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /keys/rdp_provisioner.key ]; then
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /keys/rdp_provisioner.key && \
+          openssl pkey -in /keys/rdp_provisioner.key -pubout -out /keys/rdp_provisioner.pub && \
+          echo "[rdp-key-init] generated provisioner keypair"
+        else
+          echo "[rdp-key-init] provisioner key already present"
+        fi
+    volumes:
+      - rdp-provisioner:/keys
     networks:
       - proxima-internal
 
+  # ── Devolutions Gateway (in-browser RDP proxy) ──────────────
+  # Unmodified upstream image. Speaks RDCleanPath to the browser's IronRDP web
+  # client and forwards RDP (TCP/TLS/NLA) to the guest. Trusts Proxima's
+  # provisioner public key. On proxima-net so it can (a) be reached by the
+  # frontend nginx and (b) egress to guests' :3389 on the LAN.
+  devolutions-gateway:
+    image: devolutions/devolutions-gateway:latest
+    container_name: proxima-rdp-gateway
+    restart: unless-stopped
+    depends_on:
+      rdp-key-init:
+        condition: service_completed_successfully
+    environment:
+      DGATEWAY_CONFIG_PATH: /etc/devolutions-gateway
+      # Upstream entrypoint.ps1 REGENERATES gateway.json from these on
+      # every boot. Docker sets HOSTNAME to the container id, which the
+      # script happily picks up, so it must be set explicitly or the
+      # gateway names itself after a hash that changes on every recreate.
+      HOSTNAME: proxima-rdp-gateway
+      WEB_PORT: "7171"
+      # Parity with the hand-written gateway.json this replaced, which
+      # declared only the web listener. RDCleanPath (the browser's IronRDP
+      # client) rides the web listener; the raw TCP listener on 8181 was
+      # never published.
+      TCP_ENABLED: "false"
+    # Hand the gateway Proxima's provisioner PUBLIC key through the
+    # entrypoint's own documented import path.
+    #
+    # This replaces a single-file read-only bind of our gateway.json.
+    # That trick worked by accident: entrypoint.ps1 rewrites the config
+    # unconditionally, and the :ro mount made the write FAIL non-fatally.
+    # Nothing file-based reproduces that in a Portainer stack -- an inline
+    # `configs:` entry mounts 0444 but root overwrites it happily, and the
+    # gateway then falls back to `New-DGatewayProvisionerKeyPair -Force`,
+    # trusting a key Proxima never signs with. Every RDP session would
+    # fail token validation, with a perfectly healthy-looking container.
+    #
+    # PROVISIONER_PUBLIC_KEY_B64 is the supported alternative: the script
+    # calls Import-DGatewayProvisionerKey and skips generation entirely.
+    # $$ escapes compose interpolation -- a bare $Env: is substituted to
+    # an empty string, silently putting us back on the generated key.
+    entrypoint:
+      - pwsh
+      - -c
+      - |
+        $$Env:PROVISIONER_PUBLIC_KEY_B64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes('/etc/proxima/rdp/rdp_provisioner.pub'))
+        & /usr/local/bin/entrypoint.ps1
+    volumes:
+      - rdp-provisioner:/etc/proxima/rdp:ro
+      # The gateway MUST write into its config dir (gateway.log,
+      # boot.stacktrace, entrypoint-generated files) — a fully :ro mount
+      # crash-loops it ("failed to create initial log file: Read-only file
+      # system"). So it gets a writable state volume.
+      - rdp-gateway-state:/etc/devolutions-gateway
+    networks:
+      - proxima-net
+
 networks:
-  # Reachable from the host / the frontend stack.
   proxima-net:
-  # No egress and no external reachability — db, keys and sidecar chatter.
+    name: proxima-net
   proxima-internal:
+    name: proxima-internal
+    # `internal: true` blocks egress to the host / internet but still
+    # allows attachment from other compose stacks via `external: true`.
     internal: true
 
 volumes:
   db-data:
-  jwt-keys:
-  backend-secrets:
-  sidecar-state:
   themes-data:
   branding-data:
+  # /app/data inside the backend container -- holds secrets.json
+  # (JWT signing keypair + non-sensitive app config). MUST persist
+  # across container recreations or every existing user session
+  # becomes invalid on rebuild.
+  backend-app-data:
+  # Unix domain socket shared between backend (uvicorn) and backend-nginx.
+  proxima-socket:
+  # backend-nginx state.
+  backend-nginx-certs:
+  backend-nginx-cert-state:
+  # Infisical / Valkey volumes -- only used when COMPOSE_PROFILES=infisical.
+  valkey-data:
+  # Machine Identity bundle for backend-nginx (and backend) -- written
+  # by the infisical-bootstrap one-shot, read-only from the apps.
+  infisical-backend-secrets:
+  # Cached admin token + IDs for idempotent re-runs of the bootstrap.
+  infisical-bootstrap-state:
+  # Machine Identity bundle for the (DMZ-separated) FRONTEND host.
+  # Written by infisical-bootstrap; the operator copies it out with
+  # `docker cp proxima-infisical-bootstrap:/var/lib/proxima/frontend-bundle ./`.
+  infisical-frontend-bundle:
+  # RDP gateway provisioner keypair (private → backend, public → gateway).
+  rdp-provisioner:
+  # Devolutions Gateway writable state: logs, job/audit databases, and
+  # the gateway.json + provisioner.pem its entrypoint writes on boot
+  # from PROVISIONER_PUBLIC_KEY_B64 and the listener env vars.
+  rdp-gateway-state:
