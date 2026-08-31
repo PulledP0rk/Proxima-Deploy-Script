@@ -235,7 +235,17 @@ function render(target) {
         `Pass --siblings <dir> or check out the source repo there.`,
     );
   }
-  const srcLines = readFileSync(target.src, "utf8").split("\n");
+  // Normalise to LF. The sources are edited on Windows and are wholly CRLF,
+  // and splitting on "\n" alone leaves a trailing "\r" on every line, which
+  // the rejoin then preserves. These files are deployment artefacts for Linux
+  // hosts and get pasted into Portainer, so they should be LF: it keeps diffs
+  // against a stored stack meaningful, and keeps the embedded shell (the
+  // db-init heredoc, the gateway entrypoint) out of the class of bugs where a
+  // "SQL\r" terminator never matches "SQL". YAML block scalars normalise line
+  // breaks so CRLF happens to survive today -- that is luck, not a guarantee.
+  const srcLines = readFileSync(target.src, "utf8")
+    .split("\n")
+    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
 
   const out = [];
   let i = 0;

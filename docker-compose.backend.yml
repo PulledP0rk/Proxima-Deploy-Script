@@ -96,7 +96,13 @@
 #    IMAGE_TAG          image tag to run                  (latest)
 #    PROXIMA_VERSION    version label on the containers   (0.2.0)
 #    REGISTRY_USERNAME / REGISTRY_PASSWORD
-#                       update-check + agent pulls — NOT the image pull
+#                       update-check + agent pulls — NOT the image pull.
+#                       Set BOTH or neither: a username with an empty
+#                       password is treated as anonymous and every
+#                       private repo answers 401. If the username is a
+#                       Harbor robot it contains a '$' — escape it as
+#                       '$$' or compose interpolates it away, turning
+#                       robot$name into plain "robot".
 #
 #  ── Updates are notify-only ────────────────────────────────────
 #    There is no auto-updater in this stack. The backend lists the
@@ -356,7 +362,11 @@ services:
   # install would share one signing key, so a token minted against any
   # deployment would authenticate against all of them.
   jwt-key-init:
-    image: alpine/openssl:latest
+    # Pinned by DIGEST, not `:latest`. "Re-pull image and redeploy" pulls
+    # every image in the stack, so a mutable third-party tag lets a routine
+    # Proxima update silently swap an unrelated dependency underneath you.
+    # Manifest-list digest: resolves on amd64 and arm64 alike.
+    image: alpine/openssl@sha256:61cec9c1f221755bf995f1f309211b222164599e2d1943b666f878ef644d3a0e
     container_name: proxima-jwt-key-init
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]
@@ -556,7 +566,8 @@ services:
   # reads the private key; the gateway trusts the matching public key. openssl
   # is already in the image, so no network/egress is needed.
   rdp-key-init:
-    image: alpine/openssl:latest
+    # Same digest pin as jwt-key-init above -- keep the two in step.
+    image: alpine/openssl@sha256:61cec9c1f221755bf995f1f309211b222164599e2d1943b666f878ef644d3a0e
     container_name: proxima-rdp-key-init
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]
@@ -580,7 +591,19 @@ services:
   # provisioner public key. On proxima-net so it can (a) be reached by the
   # frontend nginx and (b) egress to guests' :3389 on the LAN.
   devolutions-gateway:
-    image: devolutions/devolutions-gateway:latest
+    # Pinned by DIGEST. This is the image that has been verified working here,
+    # including the ARM ICU workaround below; it self-reports version 2026.2.3.
+    #
+    # NB the `:2026.2.3` TAG is a DIFFERENT image (sha256:59b2c8b9...) -- the
+    # vendor rebuilt `:latest` after cutting that tag, so pinning to the
+    # version tag would have SWAPPED the image rather than frozen it, which is
+    # the opposite of the intent. Verify before assuming a version tag and a
+    # running container are the same thing.
+    #
+    # Manifest-list digest: resolves on amd64 and arm64 alike. To move it,
+    # check the new digest carries both platforms and still boots on ARM
+    # (the arm64 image ships no ICU -- see DOTNET_SYSTEM_GLOBALIZATION_INVARIANT).
+    image: devolutions/devolutions-gateway@sha256:f9ea0f4d2326f007ee7ef2125e263e7e1cd9244f469351a78d6768a1ad454887
     container_name: proxima-rdp-gateway
     restart: unless-stopped
     depends_on:

@@ -131,10 +131,24 @@ Paste `docker-compose.backend.yml`, then set these environment variables:
 | `INFISICAL_AUTH_SECRET` | **change it** | `openssl rand -hex 32` |
 | `INFISICAL_BOOTSTRAP_EMAIL` | **yes, no default** | Stack won't start without it |
 | `INFISICAL_BOOTSTRAP_PASSWORD` | **yes, no default** | Stack won't start without it |
-| `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` | optional | Update checks + agent pulls, *not* the image pull |
+| `REGISTRY_USERNAME` / `REGISTRY_PASSWORD` | for update checks | Update checks + agent pulls, *not* the image pull. **Set both or neither**, and escape a `$` in the username as `$$` — see below |
 | `BACKEND_PORT` / `AGENT_PORT` / `INFISICAL_UI_PORT` | optional | Default `8443` / `8444` / `8088` |
 
 There is **no compose profile to set**. Every service starts unconditionally.
+
+> **Harbor robot names contain a `$`, and compose eats it.** Setting
+> `REGISTRY_USERNAME=robot$closedbeta` in a `.env` or stack variable resolves to
+> plain `robot` — `$closedbeta` is interpolated as an (undefined) variable.
+> Write it as `robot$$closedbeta`. Verify what the container actually received,
+> because nothing warns you:
+>
+> ```bash
+> docker inspect proxima-backend --format '{{range .Config.Env}}{{println .}}{{end}}' \
+>   | grep REGISTRY_USERNAME
+> ```
+>
+> Note this is the *opposite* of the `docker login` rule above, where the name is
+> single-quoted so the shell leaves it alone. Same `$`, two different escapes.
 
 Wait for these three one-shots to reach **Exited (0)** — the stack is not ready
 until they have:
@@ -290,6 +304,57 @@ available separately via `docker logs proxima-backend`.
 If you get `TUI socket not found`, the container has not finished starting —
 wait a moment and check `docker logs proxima-backend`.
 
+### Rack console — the TUI on an attached monitor, 24/7
+
+`scripts/setup-rack-console.sh` turns a monitor attached to the host into a
+permanent display of the backend TUI: autologin on `tty1` at boot, the TUI full
+screen, and a screen that never blanks.
+
+```bash
+sudo ./scripts/setup-rack-console.sh
+sudo systemctl restart getty@tty1     # start it now, without rebooting
+```
+
+Idempotent — safe to re-run. Options: `--user NAME`, `--tty N`,
+`--container NAME`, `--no-video`.
+
+**Escaping out.** `Ctrl+Alt+F2` (through `F6`) give ordinary login prompts on the
+other virtual terminals. The console is a display, not a lockout. `Ctrl-\`
+detaches the TUI and returns to the console loop, which re-attaches.
+
+> **Never quit the TUI with `q` or `Ctrl-C`.** `docker-supervisor.sh` is PID 1
+> inside the container and ends with `wait "$TUI_PID"`, so quitting the TUI
+> **stops the backend container**. `restart: unless-stopped` brings it back and
+> the console loop re-attaches, but it is a real outage. The console prints this
+> warning on every attach.
+
+**What it sets up, and why:**
+
+- A dedicated user (default `proxima-tui`) whose password is **locked**, not
+  empty. Autologin never consults it, so the effect is the passwordless boot
+  login you want — but an empty password would also let anyone log in as that
+  account from another tty or over SSH.
+- The user is **not** in the `docker` group. That group is root-equivalent, and
+  this account logs in automatically with no credential, so membership would
+  hand root to anyone standing at the rack. A single root-owned helper
+  (`/usr/local/bin/proxima-tui-attach`) is allow-listed through `sudo` instead,
+  and it can attach the TUI and nothing else.
+- Screen blanking off on both paths — `consoleblank=0` in `cmdline.txt` (the
+  kernel default blanks after 600s) and `hdmi_blanking=0` in `config.txt` (which
+  otherwise lets the display sleep after 10 minutes).
+- The console video mode is **pinned** to the attached display's native mode,
+  e.g. `video=HDMI-A-2:1920x1280@60`. Without this the mode depends on whatever
+  EDID the display happened to offer at boot — and a rack display is often
+  powered separately from the host, so if it is off or asleep at that moment the
+  console silently drops to a fallback mode.
+
+The blanking and video changes are boot config, so they need a **reboot**. The
+autologin and TUI work immediately after `systemctl restart getty@tty1`.
+
+**On DietPi:** leave `dietpi-autostart` on *Console: Manual Login* (index 0). Set
+to an autologin index it writes its own drop-in to
+`/etc/systemd/system/getty@tty1.service.d/`, and the two fight over that file.
+
 ### Updating
 
 Updates are **notify-only**. The backend lists the semver tags published in the
@@ -300,13 +365,33 @@ There is deliberately no auto-updating container. The old update sidecar mounted
 the Docker socket — which is root on the host — alongside the stack that holds
 every Proxmox credential, and that is a poor trade for saving one command.
 
-To update:
+To update, from the directory holding that side's compose file:
 
 ```bash
-cd proxima
 docker compose pull
 docker compose up -d
 ```
+
+Plain `docker compose`, not the `proxima-compose` wrappers — it is already on
+`PATH`, and the command is character-for-character identical on Linux, macOS and
+Windows, so there is no `.sh`/`.ps1` variant to pick.
+
+**Don't know where it is installed?** Ask the container:
+
+```bash
+docker inspect proxima-backend \
+  --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}'
+```
+
+Substitute `proxima-frontend` for the other side — the two stacks are deployed
+separately and can live in different places.
+
+> If that prints a path starting with `/data/compose/`, it is **inside the
+> Portainer container**, not on the host, and there is no host directory to
+> `cd` into. Update that stack from Portainer instead: **Stacks ▸ your stack ▸
+> Update the stack**, with *Re-pull image* enabled.
+
+Both stacks can be updated independently; a release usually bumps both.
 
 ### Uninstalling
 
@@ -398,6 +483,53 @@ Confirm it finished with the `\dt` command above (expect hundreds of tables).
 Docker Hub rate-limits unauthenticated pagination per source IP and answers 403.
 Benign: the official-images catalog is a cache, the daily loop retries, and only
 the Docker image browser's "official" list is affected.
+
+**Updates tab shows no new releases, and "latest" never resolves**
+
+Backend log:
+
+```
+WARNING src.services.update_check — Harbor tag listing failed for
+proxima-backend/app: Client error '401 Unauthorized' for url
+'https://.../v2/proxima-backend/app/tags/list'
+```
+
+The update check is authenticating as nobody. Check what the container actually
+got — not what you typed into Portainer:
+
+```bash
+docker inspect proxima-backend --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -E 'REGISTRY_(USERNAME|PASSWORD)='
+```
+
+Three ways this ends up wrong, all silent:
+
+1. **Neither is set.** Images still pull fine, because Portainer authenticates
+   the *pull* from its own stored registry credentials — the backend never sees
+   them. The two are unrelated paths.
+2. **Username only.** A username with an empty password is *worse* than none:
+   the registry issues a valid token for empty-password basic auth carrying only
+   anonymous scope, so you get a bare 401 with no hint credentials were at fault.
+   Recent builds log an explicit "credentials are incomplete" warning.
+3. **The `$` was interpolated** out of a Harbor robot name — see the note in
+   [Step 2](#step-2--deploy-the-backend-stack).
+
+Confirm the credentials themselves are good, independent of Proxima:
+
+```bash
+U='robot$yourname'; P='<token>'; REPO=proxima-backend/app
+TOK=$(curl -s -u "$U:$P" \
+  "https://updates.dev-proxima.com/service/token?service=harbor-registry&scope=repository:$REPO:pull" \
+  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+curl -s -H "Authorization: Bearer $TOK" \
+  "https://updates.dev-proxima.com/v2/$REPO/tags/list"
+```
+
+A tag list means the robot is fine and the problem is how the variables reached
+the container. A 401 means the robot lacks *pull* on that Harbor project —
+robot accounts are scoped per project, so each one (`proxima-backend`,
+`proxima-frontend`, `proxima-backend-nginx`, `proxima-infisical-bootstrap`,
+`proxima-docker-module`, `proxima-flow-agent`) must be granted separately.
 
 **Signing out does not revoke the session; brute-force limits do nothing**
 

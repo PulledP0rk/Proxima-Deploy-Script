@@ -81,7 +81,13 @@
 #    IMAGE_TAG          image tag to run                  (latest)
 #    PROXIMA_VERSION    version label on the containers   (0.2.0)
 #    REGISTRY_USERNAME / REGISTRY_PASSWORD
-#                       update-check + agent pulls — NOT the image pull
+#                       update-check + agent pulls — NOT the image pull.
+#                       Set BOTH or neither: a username with an empty
+#                       password is treated as anonymous and every
+#                       private repo answers 401. If the username is a
+#                       Harbor robot it contains a '$' — escape it as
+#                       '$$' or compose interpolates it away, turning
+#                       robot$name into plain "robot".
 #
 #  ── Updates are notify-only ────────────────────────────────────
 #    There is no auto-updater in this stack. The backend lists the
